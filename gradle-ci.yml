@@ -1,0 +1,295 @@
+# ================================================================
+# .gitlab-ci.yml  —  Gradle / Java SDK
+# Stages  : validate → build → test → publish-snapshot →
+#           publish-release → download
+# Image   : gradle:8.7-jdk17-alpine
+# Publish : snapshot  (feature/*, develop, master/main)
+#           release   (semver tag v1.2.3 — manual gate)
+# ================================================================
+
+# ────────────────────────────────────────────────────────────────
+# REQUIRED CI/CD VARIABLES  (Settings → CI/CD → Variables)
+#   ARTIFACTORY_URL             https://artifactory.company.com/artifactory
+#   ARTIFACTORY_SNAPSHOT_REPO   libs-snapshot-local
+#   ARTIFACTORY_RELEASE_REPO    libs-release-local
+#   ARTIFACTORY_VIRTUAL_REPO    libs-virtual
+#   ARTIFACTORY_USER            ← mask this
+#   ARTIFACTORY_PASSWORD        ← mask this
+#
+# OPTIONAL  (for download stage)
+#   ARTIFACT_GROUP    com.company.project
+#   ARTIFACT_ID       my-library
+#   ARTIFACT_VERSION  1.2.3 or 1.2.3-SNAPSHOT
+#   ARTIFACT_EXT      jar  (default)
+# ────────────────────────────────────────────────────────────────
+
+variables:
+  GRADLE_OPTS: >-
+    -Dorg.gradle.daemon=false
+    -Dorg.gradle.caching=true
+    -Dorg.gradle.parallel=true
+  GRADLE_USER_HOME: "$CI_PROJECT_DIR/.gradle"
+
+cache:
+  key: "gradle-$CI_COMMIT_REF_SLUG"
+  paths:
+    - .gradle/caches/
+    - .gradle/wrapper/
+
+stages:
+  - validate
+  - build
+  - test
+  - publish-snapshot
+  - publish-release
+  - download
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH =~ /^feature\/.*/'
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+    - if: '$CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
+
+# ── Shared before_script ──────────────────────────────────────
+.gradle_base:
+  image: gradle:8.7-jdk17-alpine
+  before_script:
+    - echo "=============================="
+    - echo " Gradle CI"
+    - echo " Branch  $CI_COMMIT_REF_NAME"
+    - echo " Commit  $CI_COMMIT_SHORT_SHA"
+    - echo " Runner  $CI_RUNNER_DESCRIPTION"
+    - echo "=============================="
+    - java -version
+    - |
+      if [ -f "./gradlew" ]; then
+        chmod +x ./gradlew
+        echo "GRADLE_CMD=./gradlew" >> build.env
+      else
+        echo "GRADLE_CMD=gradle" >> build.env
+      fi
+    - source build.env
+    - echo "  Gradle  $GRADLE_CMD"
+    - $GRADLE_CMD --version
+    - mkdir -p "$GRADLE_USER_HOME"
+    - |
+      cat >> "$GRADLE_USER_HOME/gradle.properties" <<PROPS
+      artifactory_url=$ARTIFACTORY_URL
+      artifactory_snapshot_repo=$ARTIFACTORY_SNAPSHOT_REPO
+      artifactory_release_repo=$ARTIFACTORY_RELEASE_REPO
+      artifactory_virtual_repo=$ARTIFACTORY_VIRTUAL_REPO
+      artifactory_user=$ARTIFACTORY_USER
+      artifactory_password=$ARTIFACTORY_PASSWORD
+      PROPS
+    - echo "[OK] gradle.properties configured"
+
+# ── VALIDATE ─────────────────────────────────────────────────
+validate:
+  extends: .gradle_base
+  stage: validate
+  script:
+    - source build.env 2>/dev/null || true
+    - echo "=== Validate Gradle project ==="
+    - |
+      if [ ! -f "build.gradle" ] && [ ! -f "build.gradle.kts" ]; then
+        echo "[ERROR] No build.gradle or build.gradle.kts found"
+        exit 1
+      fi
+    - ${GRADLE_CMD:-./gradlew} properties --no-daemon 2>&1 | head -30
+    - echo "[OK] Gradle project valid"
+  rules:
+    - if: '$CI_COMMIT_BRANCH || $CI_COMMIT_TAG'
+
+# ── BUILD ─────────────────────────────────────────────────────
+build:
+  extends: .gradle_base
+  stage: build
+  script:
+    - source build.env 2>/dev/null || true
+    - echo "=== Gradle Build ==="
+    - ${GRADLE_CMD:-./gradlew} clean assemble --no-daemon --info
+    - echo "=== Build artifacts ==="
+    - ls -lh build/libs/ 2>/dev/null || echo "(no build/libs)"
+  artifacts:
+    name: "gradle-build-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - build/libs/
+      - build/publications/
+    expire_in: 3 days
+  rules:
+    - if: '$CI_COMMIT_BRANCH || $CI_COMMIT_TAG'
+
+# ── TEST ──────────────────────────────────────────────────────
+test:unit:
+  extends: .gradle_base
+  stage: test
+  needs: [build]
+  script:
+    - source build.env 2>/dev/null || true
+    - echo "=== Unit Tests ==="
+    - ${GRADLE_CMD:-./gradlew} test --no-daemon --info
+    - ls -lh build/reports/tests/ 2>/dev/null || true
+  artifacts:
+    when: always
+    reports:
+      junit: build/test-results/test/TEST-*.xml
+    paths:
+      - build/reports/tests/
+      - build/test-results/
+    expire_in: 7 days
+  coverage: '/Total.*?([0-9]{1,3})%/'
+  rules:
+    - if: '$CI_COMMIT_BRANCH || $CI_COMMIT_TAG'
+
+test:integration:
+  extends: .gradle_base
+  stage: test
+  needs: [build]
+  script:
+    - source build.env 2>/dev/null || true
+    - echo "=== Integration Tests ==="
+    - |
+      if ${GRADLE_CMD:-./gradlew} tasks --all --no-daemon 2>/dev/null | grep -q "integrationTest"; then
+        ${GRADLE_CMD:-./gradlew} integrationTest --no-daemon --info
+      else
+        echo "[SKIP] No integrationTest task found"
+      fi
+  artifacts:
+    when: always
+    reports:
+      junit: build/test-results/integrationTest/TEST-*.xml
+    expire_in: 7 days
+  allow_failure: false
+  rules:
+    - if: '$CI_COMMIT_BRANCH || $CI_COMMIT_TAG'
+
+# ── PUBLISH SNAPSHOT ─────────────────────────────────────────
+# Auto-triggers on  feature/*, develop, master/main
+publish:snapshot:
+  extends: .gradle_base
+  stage: publish-snapshot
+  needs:
+    - job: build
+      artifacts: true
+    - job: test:unit
+  script:
+    - source build.env 2>/dev/null || true
+    - echo "=== Publish Snapshot ==="
+    - CURRENT_VER=$(${GRADLE_CMD:-./gradlew} properties -q --no-daemon | grep "^version:" | awk '{print $2}' | tr -d '[:space:]')
+    - BASE_VER=$(echo "$CURRENT_VER" | sed 's/-SNAPSHOT//')
+    - SNAP_VER="${BASE_VER}-SNAPSHOT"
+    - echo "  Base     $BASE_VER"
+    - echo "  Snap     $SNAP_VER"
+    - echo "  Repo     $ARTIFACTORY_SNAPSHOT_REPO"
+    - echo "  URL      $ARTIFACTORY_URL/$ARTIFACTORY_SNAPSHOT_REPO"
+    - |
+      ${GRADLE_CMD:-./gradlew} publish \
+        --no-daemon \
+        --info \
+        --stacktrace \
+        -Pversion="$SNAP_VER" \
+        -Partifactory_target_repo="$ARTIFACTORY_SNAPSHOT_REPO"
+    - echo "=== Snapshot published ==="
+    - echo "  $SNAP_VER → $ARTIFACTORY_URL/$ARTIFACTORY_SNAPSHOT_REPO"
+  environment:
+    name: gradle-snapshot
+    url: "$ARTIFACTORY_URL/$ARTIFACTORY_SNAPSHOT_REPO"
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^feature\/.*/'
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+    - if: '$CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"'
+
+# ── PUBLISH RELEASE ──────────────────────────────────────────
+# Only runs on tag v1.2.3 — requires manual click in GitLab UI
+publish:release:
+  extends: .gradle_base
+  stage: publish-release
+  needs:
+    - job: build
+      artifacts: true
+    - job: test:unit
+  script:
+    - source build.env 2>/dev/null || true
+    - echo "=== Publish Release ==="
+    - RELEASE_VER="${CI_COMMIT_TAG#v}"
+    - |
+      if echo "$RELEASE_VER" | grep -qiE '(snapshot|dev|alpha|beta|rc)'; then
+        echo "[ERROR] Release version must be clean semver — got $RELEASE_VER"
+        exit 1
+      fi
+    - echo "  Version  $RELEASE_VER"
+    - echo "  Repo     $ARTIFACTORY_RELEASE_REPO"
+    - echo "  URL      $ARTIFACTORY_URL/$ARTIFACTORY_RELEASE_REPO"
+    - |
+      ${GRADLE_CMD:-./gradlew} publish \
+        --no-daemon \
+        --info \
+        --stacktrace \
+        -Pversion="$RELEASE_VER" \
+        -Partifactory_target_repo="$ARTIFACTORY_RELEASE_REPO"
+    - echo "=== Release published ==="
+    - echo "  $RELEASE_VER → $ARTIFACTORY_URL/$ARTIFACTORY_RELEASE_REPO"
+  environment:
+    name: gradle-release
+    url: "$ARTIFACTORY_URL/$ARTIFACTORY_RELEASE_REPO"
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
+      when: manual
+
+# ── DOWNLOAD ─────────────────────────────────────────────────
+# Needs: ARTIFACT_GROUP, ARTIFACT_ID, ARTIFACT_VERSION in CI vars
+# ARTIFACT_EXT defaults to jar
+# Auto on release tags, or trigger manually any time
+download:artifact:
+  extends: .gradle_base
+  stage: download
+  needs: []
+  script:
+    - echo "=== Download ==="
+    - GROUP="${ARTIFACT_GROUP:?Set ARTIFACT_GROUP in CI/CD variables}"
+    - ID="${ARTIFACT_ID:?Set ARTIFACT_ID in CI/CD variables}"
+    - VER="${ARTIFACT_VERSION:?Set ARTIFACT_VERSION in CI/CD variables}"
+    - EXT="${ARTIFACT_EXT:-jar}"
+    - GROUP_PATH=$(echo "$GROUP" | tr '.' '/')
+    - FILENAME="${ID}-${VER}.${EXT}"
+    - |
+      if echo "$VER" | grep -qi "SNAPSHOT"; then
+        REPO="$ARTIFACTORY_SNAPSHOT_REPO"
+      else
+        REPO="$ARTIFACTORY_RELEASE_REPO"
+      fi
+    - ARTIFACT_URL="$ARTIFACTORY_URL/$REPO/$GROUP_PATH/$ID/$VER/$FILENAME"
+    - echo "  Group    $GROUP"
+    - echo "  ID       $ID"
+    - echo "  Version  $VER"
+    - echo "  Ext      $EXT"
+    - echo "  Repo     $REPO"
+    - echo "  URL      $ARTIFACT_URL"
+    - mkdir -p downloaded-artifacts
+    - |
+      curl \
+        --fail \
+        --silent \
+        --show-error \
+        --user "$ARTIFACTORY_USER:$ARTIFACTORY_PASSWORD" \
+        --output "downloaded-artifacts/$FILENAME" \
+        "$ARTIFACT_URL"
+    - echo "=== Downloaded files ==="
+    - ls -lh downloaded-artifacts/
+    - |
+      FILE="downloaded-artifacts/$FILENAME"
+      if [ -f "$FILE" ] && echo "$FILE" | grep -q "\.jar$"; then
+        echo "=== JAR manifest ==="
+        unzip -p "$FILE" META-INF/MANIFEST.MF 2>/dev/null || echo "(no manifest)"
+      fi
+  artifacts:
+    name: "gradle-download-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - downloaded-artifacts/
+    expire_in: 7 days
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
+      when: on_success
+    - when: manual
