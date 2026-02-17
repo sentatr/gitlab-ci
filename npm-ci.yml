@@ -1,0 +1,325 @@
+# ================================================================
+# .gitlab-ci.yml  —  NPM / Node.js SDK
+# Stages  : validate → install → build → test →
+#           publish-snapshot → publish-release → download
+# Node    : 16 · 18 · 22 · 24
+# Publish : snapshot  (feature/*, develop, master/main)
+#           release   (semver tag v1.2.3 — manual gate)
+# ================================================================
+
+# ────────────────────────────────────────────────────────────────
+# REQUIRED CI/CD VARIABLES  (Settings → CI/CD → Variables)
+#   ARTIFACTORY_URL        https://artifactory.company.com/artifactory
+#   NPM_SNAPSHOT_REPO      npm-snapshot-local
+#   NPM_RELEASE_REPO       npm-release-local
+#   NPM_VIRTUAL_REPO       npm-virtual
+#   NPM_USER               ← mask this
+#   NPM_PASSWORD           ← mask this
+#   NPM_AUTH_TOKEN         ← mask this  (Artifactory API key)
+#   NPM_EMAIL              ci@company.com
+# ────────────────────────────────────────────────────────────────
+
+variables:
+  npm_config_cache: "$CI_PROJECT_DIR/.npm-cache"
+  NPM_SNAPSHOT_REGISTRY: "$ARTIFACTORY_URL/api/npm/$NPM_SNAPSHOT_REPO/"
+  NPM_RELEASE_REGISTRY: "$ARTIFACTORY_URL/api/npm/$NPM_RELEASE_REPO/"
+  NPM_DOWNLOAD_REGISTRY: "$ARTIFACTORY_URL/api/npm/$NPM_VIRTUAL_REPO/"
+
+cache:
+  key:
+    files:
+      - package-lock.json
+  paths:
+    - .npm-cache/
+
+stages:
+  - validate
+  - install
+  - build
+  - test
+  - publish-snapshot
+  - publish-release
+  - download
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH =~ /^feature\/.*/'
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+    - if: '$CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
+
+# ── Shared before_script ──────────────────────────────────────
+.npm_base:
+  before_script:
+    - echo "=============================="
+    - echo " NPM CI"
+    - echo " Node    $(node --version)"
+    - echo " NPM     $(npm --version)"
+    - echo " Branch  $CI_COMMIT_REF_NAME"
+    - echo " Commit  $CI_COMMIT_SHORT_SHA"
+    - echo "=============================="
+    - B64_PASS=$(echo -n "$NPM_PASSWORD" | base64)
+    - REGISTRY_HOST=$(echo "$ARTIFACTORY_URL" | sed 's|https\?://||;s|/.*||')
+    - |
+      cat > .npmrc <<NPMRC
+      registry=$NPM_DOWNLOAD_REGISTRY
+      always-auth=true
+      email=$NPM_EMAIL
+
+      //$REGISTRY_HOST/artifactory/api/npm/$NPM_VIRTUAL_REPO/:_authToken=$NPM_AUTH_TOKEN
+      //$REGISTRY_HOST/artifactory/api/npm/$NPM_VIRTUAL_REPO/:username=$NPM_USER
+      //$REGISTRY_HOST/artifactory/api/npm/$NPM_VIRTUAL_REPO/:_password=$B64_PASS
+
+      //$REGISTRY_HOST/artifactory/api/npm/$NPM_SNAPSHOT_REPO/:_authToken=$NPM_AUTH_TOKEN
+      //$REGISTRY_HOST/artifactory/api/npm/$NPM_SNAPSHOT_REPO/:username=$NPM_USER
+      //$REGISTRY_HOST/artifactory/api/npm/$NPM_SNAPSHOT_REPO/:_password=$B64_PASS
+
+      //$REGISTRY_HOST/artifactory/api/npm/$NPM_RELEASE_REPO/:_authToken=$NPM_AUTH_TOKEN
+      //$REGISTRY_HOST/artifactory/api/npm/$NPM_RELEASE_REPO/:username=$NPM_USER
+      //$REGISTRY_HOST/artifactory/api/npm/$NPM_RELEASE_REPO/:_password=$B64_PASS
+
+      strict-ssl=true
+      fetch-retries=3
+      fetch-retry-mintimeout=10000
+      fetch-retry-maxtimeout=60000
+      loglevel=notice
+      NPMRC
+    - echo "[OK] .npmrc written"
+
+# ── VALIDATE ─────────────────────────────────────────────────
+validate:
+  extends: .npm_base
+  stage: validate
+  image: node:18-alpine
+  script:
+    - echo "=== Validate package.json ==="
+    - |
+      if [ ! -f "package.json" ]; then
+        echo "[ERROR] package.json not found"; exit 1
+      fi
+    - node -e "JSON.parse(require('fs').readFileSync('package.json','utf8')); console.log('[OK] package.json valid')"
+    - echo "  Name    $(node -p "require('./package.json').name")"
+    - echo "  Version $(node -p "require('./package.json').version")"
+  rules:
+    - if: '$CI_COMMIT_BRANCH || $CI_COMMIT_TAG'
+
+# ── INSTALL (parallel across Node versions) ──────────────────
+.install_tpl:
+  extends: .npm_base
+  stage: install
+  script:
+    - echo "=== Install ($(node --version)) ==="
+    - npm ci --prefer-offline
+    - echo "[OK] node_modules ready"
+  artifacts:
+    name: "node-modules-$CI_COMMIT_SHORT_SHA-$CI_JOB_NAME"
+    paths:
+      - node_modules/
+    expire_in: 1 hour
+  rules:
+    - if: '$CI_COMMIT_BRANCH || $CI_COMMIT_TAG'
+
+install:node16:
+  extends: .install_tpl
+  image: node:16-alpine
+
+install:node18:
+  extends: .install_tpl
+  image: node:18-alpine
+
+install:node22:
+  extends: .install_tpl
+  image: node:22-alpine
+
+install:node24:
+  extends: .install_tpl
+  image: node:24-alpine
+  allow_failure: true
+
+# ── BUILD (parallel across Node versions) ────────────────────
+.build_tpl:
+  extends: .npm_base
+  stage: build
+  script:
+    - echo "=== Build ($(node --version)) ==="
+    - |
+      if npm run | grep -q "build"; then
+        npm run build
+      else
+        echo "[SKIP] No build script found"
+      fi
+    - ls -lh dist/ 2>/dev/null || ls -lh lib/ 2>/dev/null || echo "(no dist/lib)"
+  artifacts:
+    name: "npm-build-$CI_COMMIT_SHORT_SHA-$CI_JOB_NAME"
+    paths:
+      - dist/
+      - lib/
+    expire_in: 1 day
+  rules:
+    - if: '$CI_COMMIT_BRANCH || $CI_COMMIT_TAG'
+
+build:node16:
+  extends: .build_tpl
+  image: node:16-alpine
+  needs: [install:node16]
+
+build:node18:
+  extends: .build_tpl
+  image: node:18-alpine
+  needs: [install:node18]
+
+build:node22:
+  extends: .build_tpl
+  image: node:22-alpine
+  needs: [install:node22]
+
+# ── TEST (parallel across Node versions) ─────────────────────
+.test_tpl:
+  extends: .npm_base
+  stage: test
+  script:
+    - echo "=== Test ($(node --version)) ==="
+    - |
+      if npm run | grep -q " test"; then
+        npm test -- --ci --coverage 2>/dev/null || npm test
+      else
+        echo "[SKIP] No test script found"
+      fi
+    - ls -lh coverage/ 2>/dev/null || echo "(no coverage folder)"
+  artifacts:
+    when: always
+    reports:
+      junit: junit.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura-coverage.xml
+    paths:
+      - coverage/
+    expire_in: 7 days
+  coverage: '/All files[^|]*\|[^|]*\s+([\d\.]+)/'
+  rules:
+    - if: '$CI_COMMIT_BRANCH || $CI_COMMIT_TAG'
+
+test:node16:
+  extends: .test_tpl
+  image: node:16-alpine
+  needs: [build:node16]
+
+test:node18:
+  extends: .test_tpl
+  image: node:18-alpine
+  needs: [build:node18]
+
+test:node22:
+  extends: .test_tpl
+  image: node:22-alpine
+  needs: [build:node22]
+
+# ── PUBLISH SNAPSHOT ─────────────────────────────────────────
+# Auto-triggers on  feature/*, develop, master/main
+publish:snapshot:
+  extends: .npm_base
+  stage: publish-snapshot
+  image: node:18-alpine
+  needs:
+    - job: build:node18
+      artifacts: true
+    - job: test:node18
+  script:
+    - echo "=== Publish Snapshot ==="
+    - BASE_VER=$(node -p "require('./package.json').version")
+    - CLEAN_VER=$(echo "$BASE_VER" | sed 's/-[^+]*//')
+    - SNAP_VER="${CLEAN_VER}-snapshot.${CI_PIPELINE_ID}"
+    - PKG_NAME=$(node -p "require('./package.json').name")
+    - echo "  Package  $PKG_NAME"
+    - echo "  Base     $BASE_VER"
+    - echo "  Snap     $SNAP_VER"
+    - echo "  Repo     $NPM_SNAPSHOT_REPO"
+    - npm version "$SNAP_VER" --no-git-tag-version --allow-same-version
+    - npm publish --registry "$NPM_SNAPSHOT_REGISTRY" --tag snapshot --verbose
+    - echo "=== Snapshot published ==="
+    - echo "  npm install ${PKG_NAME}@${SNAP_VER} --registry $NPM_SNAPSHOT_REGISTRY"
+  environment:
+    name: npm-snapshot
+    url: "$NPM_SNAPSHOT_REGISTRY"
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^feature\/.*/'
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+    - if: '$CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"'
+
+# ── PUBLISH RELEASE ──────────────────────────────────────────
+# Only runs on tag v1.2.3 — requires manual click in GitLab UI
+publish:release:
+  extends: .npm_base
+  stage: publish-release
+  image: node:18-alpine
+  needs:
+    - job: build:node18
+      artifacts: true
+    - job: test:node18
+  script:
+    - echo "=== Publish Release ==="
+    - RELEASE_VER="${CI_COMMIT_TAG#v}"
+    - PKG_NAME=$(node -p "require('./package.json').name")
+    - |
+      if echo "$RELEASE_VER" | grep -qiE '(snapshot|dev|alpha|beta|rc)'; then
+        echo "[ERROR] Release version must not contain pre-release identifiers"
+        exit 1
+      fi
+    - echo "  Package  $PKG_NAME"
+    - echo "  Version  $RELEASE_VER"
+    - echo "  Repo     $NPM_RELEASE_REPO"
+    - npm version "$RELEASE_VER" --no-git-tag-version --allow-same-version
+    - npm publish --registry "$NPM_RELEASE_REGISTRY" --tag latest --verbose
+    - echo "=== Release published ==="
+    - echo "  npm install ${PKG_NAME}@${RELEASE_VER} --registry $NPM_RELEASE_REGISTRY"
+  environment:
+    name: npm-release
+    url: "$NPM_RELEASE_REGISTRY"
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
+      when: manual
+
+# ── DOWNLOAD ─────────────────────────────────────────────────
+# Set PACKAGE_NAME + PACKAGE_VERSION as pipeline/CI variables
+# Auto on release tags, or trigger manually any time
+download:package:
+  stage: download
+  image: node:18-alpine
+  before_script:
+    - B64_PASS=$(echo -n "$NPM_PASSWORD" | base64)
+    - REGISTRY_HOST=$(echo "$ARTIFACTORY_URL" | sed 's|https\?://||;s|/.*||')
+    - |
+      cat > .npmrc <<NPMRC
+      registry=$NPM_DOWNLOAD_REGISTRY
+      always-auth=true
+      //$REGISTRY_HOST/artifactory/api/npm/$NPM_VIRTUAL_REPO/:_authToken=$NPM_AUTH_TOKEN
+      //$REGISTRY_HOST/artifactory/api/npm/$NPM_VIRTUAL_REPO/:username=$NPM_USER
+      //$REGISTRY_HOST/artifactory/api/npm/$NPM_VIRTUAL_REPO/:_password=$B64_PASS
+      NPMRC
+  script:
+    - echo "=== Download ==="
+    - PKG="${PACKAGE_NAME:-$(node -p "require('./package.json').name" 2>/dev/null || echo $CI_PROJECT_NAME)}"
+    - VER="${PACKAGE_VERSION:-}"
+    - echo "  Package  $PKG"
+    - echo "  Version  ${VER:-latest}"
+    - echo "  Registry $NPM_DOWNLOAD_REGISTRY"
+    - mkdir -p downloaded-packages && cd downloaded-packages
+    - |
+      if [ -n "$VER" ]; then
+        npm pack "${PKG}@${VER}" --registry "$NPM_DOWNLOAD_REGISTRY"
+      else
+        npm pack "$PKG" --registry "$NPM_DOWNLOAD_REGISTRY"
+      fi
+    - echo "=== Downloaded files ==="
+    - ls -lh .
+  artifacts:
+    name: "npm-download-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - downloaded-packages/
+    expire_in: 7 days
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
+      when: on_success
+    - when: manual
