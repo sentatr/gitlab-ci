@@ -1,0 +1,38 @@
+# .pypirc
+# Source-controlled Python package index configuration for Artifactory
+# Placeholders below are replaced at CI runtime by .python_base before_script
+# For local dev: export the env vars in your shell, then run:
+#   envsubst < .pypirc > ~/.pypirc
+
+[distutils]
+index-servers =
+    pypi-snapshot
+    pypi-release
+
+# ── Snapshot repository ───────────────────────────────────────
+# Used for: feature/*, develop, master/main branches
+# Version format: 1.2.3.dev<pipeline-id>
+[pypi-snapshot]
+repository = ${PYPI_SNAPSHOT_INDEX}
+username   = ${PYPI_USER}
+password   = ${PYPI_PASSWORD}
+
+# ── Release repository ────────────────────────────────────────
+# Used for: semver tags only (v1.2.3)
+# Version format: 1.2.3  (no pre-release suffix)
+[pypi-release]
+repository = ${PYPI_RELEASE_INDEX}
+username   = ${PYPI_USER}
+password   = ${PYPI_PASSWORD}
+
+# ── Local dev hint ────────────────────────────────────────────
+# export ARTIFACTORY_URL="https://artifactory.company.com/artifactory"
+# export PYPI_SNAPSHOT_REPO="pypi-snapshot-local"
+# export PYPI_RELEASE_REPO="pypi-release-local"
+# export PYPI_VIRTUAL_REPO="pypi-virtual"
+# export PYPI_SNAPSHOT_INDEX="${ARTIFACTORY_URL}/api/pypi/${PYPI_SNAPSHOT_REPO}"
+# export PYPI_RELEASE_INDEX="${ARTIFACTORY_URL}/api/pypi/${PYPI_RELEASE_REPO}"
+# export PYPI_DOWNLOAD_INDEX="${ARTIFACTORY_URL}/api/pypi/${PYPI_VIRTUAL_REPO}/simple"
+# export PYPI_USER="<your-username>"
+# export PYPI_PASSWORD="<your-password-or-api-key>"
+# envsubst < .pypirc > ~/.pypirc
