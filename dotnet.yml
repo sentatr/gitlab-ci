@@ -1,0 +1,407 @@
+# ================================================================
+# .gitlab-ci.yml  —  .NET Core SDK / Library
+# Stages  : validate → restore → build → test →
+#           publish-snapshot → publish-release → download
+# .NET    : 6 · 7 · 8  (matrix builds and tests)
+# Publish : snapshot  (feature/*, develop, master/main)
+#           release   (semver tag v1.2.3  —  manual gate)
+# ================================================================
+
+# ────────────────────────────────────────────────────────────────
+# REQUIRED CI/CD VARIABLES  (Settings → CI/CD → Variables)
+#
+#   ARTIFACTORY_URL             https://artifactory.company.com/artifactory
+#   NUGET_SNAPSHOT_REPO         nuget-snapshot-local
+#   NUGET_RELEASE_REPO          nuget-release-local
+#   NUGET_VIRTUAL_REPO          nuget-virtual
+#   NUGET_API_KEY               ← mask this  (Artifactory API key)
+#   NUGET_USER                  ← mask this
+#   NUGET_PASSWORD              ← mask this
+#
+# OPTIONAL  (download stage)
+#   NUGET_PACKAGE_ID            MyCompany.MyLibrary
+#   NUGET_PACKAGE_VERSION       1.2.3  or  1.2.3-snapshot.123
+# ────────────────────────────────────────────────────────────────
+
+variables:
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: "true"
+  DOTNET_NOLOGO: "true"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "true"
+  NUGET_PACKAGES: "$CI_PROJECT_DIR/.nuget/packages"
+  NUGET_SNAPSHOT_SOURCE: "$ARTIFACTORY_URL/api/nuget/v3/$NUGET_SNAPSHOT_REPO/index.json"
+  NUGET_RELEASE_SOURCE:  "$ARTIFACTORY_URL/api/nuget/v3/$NUGET_RELEASE_REPO/index.json"
+  NUGET_DOWNLOAD_SOURCE: "$ARTIFACTORY_URL/api/nuget/v3/$NUGET_VIRTUAL_REPO/index.json"
+
+cache:
+  key: "dotnetcore-$CI_COMMIT_REF_SLUG"
+  paths:
+    - .nuget/packages/
+
+stages:
+  - validate
+  - restore
+  - build
+  - test
+  - publish-snapshot
+  - publish-release
+  - download
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH =~ /^feature\/.*/'
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+    - if: '$CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
+
+# ── Shared before_script ──────────────────────────────────────
+.dotnetcore_base:
+  before_script:
+    - echo "============================================"
+    - echo "  .NET Core CI"
+    - echo "  SDK       $(dotnet --version)"
+    - echo "  Branch    $CI_COMMIT_REF_NAME"
+    - echo "  Commit    $CI_COMMIT_SHORT_SHA"
+    - echo "  Pipeline  $CI_PIPELINE_ID"
+    - echo "============================================"
+    - |
+      # Remove stale sources to prevent duplicates across retries
+      dotnet nuget remove source "ArtifactoryVirtual"  2>/dev/null || true
+      dotnet nuget remove source "ArtifactorySnapshot" 2>/dev/null || true
+      dotnet nuget remove source "ArtifactoryRelease"  2>/dev/null || true
+
+      dotnet nuget add source "$NUGET_DOWNLOAD_SOURCE" \
+        --name "ArtifactoryVirtual" \
+        --username "$NUGET_USER" \
+        --password "$NUGET_PASSWORD" \
+        --store-password-in-clear-text
+
+      dotnet nuget add source "$NUGET_SNAPSHOT_SOURCE" \
+        --name "ArtifactorySnapshot" \
+        --username "$NUGET_USER" \
+        --password "$NUGET_PASSWORD" \
+        --store-password-in-clear-text
+
+      dotnet nuget add source "$NUGET_RELEASE_SOURCE" \
+        --name "ArtifactoryRelease" \
+        --username "$NUGET_USER" \
+        --password "$NUGET_PASSWORD" \
+        --store-password-in-clear-text
+    - echo "[OK] NuGet sources registered"
+    - dotnet nuget list source
+
+# ─────────────────────────────────────────────────────────────
+# VALIDATE
+# ─────────────────────────────────────────────────────────────
+validate:
+  extends: .dotnetcore_base
+  stage: validate
+  image: mcr.microsoft.com/dotnet/sdk:8.0
+  script:
+    - echo "=== Validate project structure ==="
+    - |
+      SLN=$(find . -name '*.sln' -not -path './.git/*' | head -1)
+      CSPROJ=$(find . -name '*.csproj' -not -path './.git/*' | head -1)
+      if [ -z "$SLN" ] && [ -z "$CSPROJ" ]; then
+        echo "[ERROR] No .sln or .csproj found"
+        exit 1
+      fi
+      if [ -n "$SLN" ]; then
+        echo "  Solution : $SLN"
+        dotnet sln "$SLN" list
+      else
+        echo "  Project  : $CSPROJ"
+      fi
+    - echo "[OK] Structure valid"
+  rules:
+    - if: '$CI_COMMIT_BRANCH || $CI_COMMIT_TAG'
+
+# ─────────────────────────────────────────────────────────────
+# RESTORE
+# ─────────────────────────────────────────────────────────────
+restore:
+  extends: .dotnetcore_base
+  stage: restore
+  image: mcr.microsoft.com/dotnet/sdk:8.0
+  script:
+    - echo "=== Restore NuGet packages ==="
+    - dotnet restore --verbosity normal
+    - echo "[OK] Restore complete"
+  artifacts:
+    paths:
+      - .nuget/packages/
+    expire_in: 1 hour
+  rules:
+    - if: '$CI_COMMIT_BRANCH || $CI_COMMIT_TAG'
+
+# ─────────────────────────────────────────────────────────────
+# BUILD  (parallel across .NET versions)
+# ─────────────────────────────────────────────────────────────
+.build_tpl:
+  extends: .dotnetcore_base
+  stage: build
+  needs: [restore]
+  script:
+    - echo "=== Build (.NET $(dotnet --version)) ==="
+    - dotnet build --configuration Release --no-restore --verbosity normal
+    - echo "=== Compiled assemblies ==="
+    - find . -name '*.dll' -path '*/bin/Release/*' -not -path './.git/*' | sort
+  artifacts:
+    name: "dotnetcore-build-$CI_COMMIT_SHORT_SHA-$CI_JOB_NAME"
+    paths:
+      - "**/bin/Release/"
+      - "**/obj/"
+    expire_in: 3 days
+  rules:
+    - if: '$CI_COMMIT_BRANCH || $CI_COMMIT_TAG'
+
+build:dotnet6:
+  extends: .build_tpl
+  image: mcr.microsoft.com/dotnet/sdk:6.0
+
+build:dotnet7:
+  extends: .build_tpl
+  image: mcr.microsoft.com/dotnet/sdk:7.0
+
+build:dotnet8:
+  extends: .build_tpl
+  image: mcr.microsoft.com/dotnet/sdk:8.0
+
+# ─────────────────────────────────────────────────────────────
+# TEST  (parallel across .NET versions)
+# ─────────────────────────────────────────────────────────────
+.test_tpl:
+  extends: .dotnetcore_base
+  stage: test
+  script:
+    - echo "=== Test (.NET $(dotnet --version)) ==="
+    - dotnet restore --verbosity quiet
+    - |
+      dotnet test \
+        --configuration Release \
+        --no-restore \
+        --verbosity normal \
+        --logger "trx;LogFileName=TestResults.trx" \
+        --logger "console;verbosity=normal" \
+        --collect:"XPlat Code Coverage" \
+        --results-directory ./TestResults \
+        -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=cobertura
+    - echo "=== Test results ==="
+    - find ./TestResults -name '*.trx' | head -5
+    - find ./TestResults -name 'coverage.cobertura.xml' | head -5
+  artifacts:
+    when: always
+    reports:
+      junit: "TestResults/**/*.trx"
+      coverage_report:
+        coverage_format: cobertura
+        path: "TestResults/**/coverage.cobertura.xml"
+    paths:
+      - TestResults/
+    expire_in: 7 days
+  coverage: '/Total\s*\|\s*[\d.]+%\s*\|\s*[\d.]+%\s*\|\s*([\d.]+%)/'
+  rules:
+    - if: '$CI_COMMIT_BRANCH || $CI_COMMIT_TAG'
+
+test:dotnet6:
+  extends: .test_tpl
+  image: mcr.microsoft.com/dotnet/sdk:6.0
+  needs: [build:dotnet6]
+
+test:dotnet7:
+  extends: .test_tpl
+  image: mcr.microsoft.com/dotnet/sdk:7.0
+  needs: [build:dotnet7]
+
+test:dotnet8:
+  extends: .test_tpl
+  image: mcr.microsoft.com/dotnet/sdk:8.0
+  needs: [build:dotnet8]
+
+# ─────────────────────────────────────────────────────────────
+# PUBLISH SNAPSHOT
+# Auto-triggers on  feature/*, develop, master/main
+# Version : 1.2.3-snapshot.<pipeline-id>
+# ─────────────────────────────────────────────────────────────
+publish:snapshot:
+  extends: .dotnetcore_base
+  stage: publish-snapshot
+  image: mcr.microsoft.com/dotnet/sdk:8.0
+  needs:
+    - job: build:dotnet8
+    - job: test:dotnet8
+  script:
+    - echo "=== Publish Snapshot ==="
+    - |
+      CSPROJ=$(find . -name '*.csproj' \
+        -not -path './.git/*' \
+        -not -name '*.Test.csproj' \
+        -not -name '*.Tests.csproj' | head -1)
+
+      BASE_VER=$(grep -oPm1 '(?<=<Version>)[^<]+' "$CSPROJ" 2>/dev/null || \
+                 grep -oPm1 '(?<=<VersionPrefix>)[^<]+' "$CSPROJ" 2>/dev/null || \
+                 echo "1.0.0")
+      CLEAN_VER=$(echo "$BASE_VER" | sed 's/-[a-zA-Z].*//')
+      SNAP_VER="${CLEAN_VER}-snapshot.${CI_PIPELINE_ID}"
+
+      echo "  Project  : $CSPROJ"
+      echo "  Base     : $BASE_VER"
+      echo "  Snapshot : $SNAP_VER"
+      echo "  Repo     : $NUGET_SNAPSHOT_REPO"
+    - dotnet restore --verbosity quiet
+    - |
+      dotnet pack \
+        --configuration Release \
+        --no-restore \
+        --output ./nupkgs \
+        --verbosity normal \
+        -p:Version="$SNAP_VER" \
+        -p:PackageVersion="$SNAP_VER"
+    - echo "=== Packages ready ==="
+    - ls -lh ./nupkgs/
+    - |
+      for NUPKG in ./nupkgs/*.nupkg; do
+        echo "  Pushing : $NUPKG"
+        dotnet nuget push "$NUPKG" \
+          --source "$NUGET_SNAPSHOT_SOURCE" \
+          --api-key "$NUGET_API_KEY" \
+          --skip-duplicate \
+          --no-symbols
+      done
+    - echo "=== Snapshot published ==="
+    - echo "  $SNAP_VER → $NUGET_SNAPSHOT_REPO"
+  artifacts:
+    name: "nuget-snapshot-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - nupkgs/
+    expire_in: 7 days
+  environment:
+    name: nuget-snapshot
+    url: "$NUGET_SNAPSHOT_SOURCE"
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^feature\/.*/'
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+    - if: '$CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"'
+
+# ─────────────────────────────────────────────────────────────
+# PUBLISH RELEASE
+# Only on tag v1.2.3  —  requires manual click in GitLab UI
+# ─────────────────────────────────────────────────────────────
+publish:release:
+  extends: .dotnetcore_base
+  stage: publish-release
+  image: mcr.microsoft.com/dotnet/sdk:8.0
+  needs:
+    - job: build:dotnet8
+    - job: test:dotnet8
+  script:
+    - echo "=== Publish Release ==="
+    - |
+      RELEASE_VER="${CI_COMMIT_TAG#v}"
+
+      if ! echo "$RELEASE_VER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+        echo "[ERROR] Tag must be vX.Y.Z — got $CI_COMMIT_TAG"; exit 1
+      fi
+      if echo "$RELEASE_VER" | grep -qiE '(snapshot|dev|alpha|beta|rc)'; then
+        echo "[ERROR] Release tag must not contain pre-release identifiers"; exit 1
+      fi
+
+      echo "  Version  : $RELEASE_VER"
+      echo "  Repo     : $NUGET_RELEASE_REPO"
+    - dotnet restore --verbosity quiet
+    - |
+      dotnet pack \
+        --configuration Release \
+        --no-restore \
+        --output ./nupkgs \
+        --verbosity normal \
+        -p:Version="$RELEASE_VER" \
+        -p:PackageVersion="$RELEASE_VER"
+    - echo "=== Packages ready ==="
+    - ls -lh ./nupkgs/
+    - |
+      for NUPKG in ./nupkgs/*.nupkg; do
+        echo "  Pushing : $NUPKG"
+        dotnet nuget push "$NUPKG" \
+          --source "$NUGET_RELEASE_SOURCE" \
+          --api-key "$NUGET_API_KEY" \
+          --skip-duplicate \
+          --no-symbols
+      done
+    - echo "=== Release published ==="
+    - echo "  $RELEASE_VER → $NUGET_RELEASE_REPO"
+  artifacts:
+    name: "nuget-release-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - nupkgs/
+    expire_in: 90 days
+  environment:
+    name: nuget-release
+    url: "$NUGET_RELEASE_SOURCE"
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
+      when: manual
+
+# ─────────────────────────────────────────────────────────────
+# DOWNLOAD
+# Set NUGET_PACKAGE_ID + NUGET_PACKAGE_VERSION in CI/CD vars
+# Auto on release tags; also available as manual trigger
+# ─────────────────────────────────────────────────────────────
+download:package:
+  stage: download
+  image: mcr.microsoft.com/dotnet/sdk:8.0
+  variables:
+    DOTNET_SKIP_FIRST_TIME_EXPERIENCE: "true"
+    DOTNET_NOLOGO: "true"
+    DOTNET_CLI_TELEMETRY_OPTOUT: "true"
+  before_script:
+    - dotnet nuget remove source "ArtifactoryVirtual" 2>/dev/null || true
+    - |
+      dotnet nuget add source "$NUGET_DOWNLOAD_SOURCE" \
+        --name "ArtifactoryVirtual" \
+        --username "$NUGET_USER" \
+        --password "$NUGET_PASSWORD" \
+        --store-password-in-clear-text
+    - echo "[OK] Download source configured"
+  script:
+    - echo "=== Download NuGet Package ==="
+    - |
+      PKG_ID="${NUGET_PACKAGE_ID:?Set NUGET_PACKAGE_ID in CI/CD variables}"
+      PKG_VER="${NUGET_PACKAGE_VERSION:-}"
+      echo "  Package : $PKG_ID"
+      echo "  Version : ${PKG_VER:-latest}"
+      echo "  Source  : $NUGET_DOWNLOAD_SOURCE"
+      mkdir -p downloaded-packages
+    - |
+      # Create temp project to drive dotnet restore as the download mechanism
+      mkdir -p /tmp/dl-project && cd /tmp/dl-project
+      dotnet new classlib -n Downloader --no-restore -f net8.0 --force
+      cd Downloader
+      if [ -n "$NUGET_PACKAGE_VERSION" ]; then
+        dotnet add package "$NUGET_PACKAGE_ID" \
+          --version "$NUGET_PACKAGE_VERSION" \
+          --source "$NUGET_DOWNLOAD_SOURCE" \
+          --no-restore
+      else
+        dotnet add package "$NUGET_PACKAGE_ID" \
+          --source "$NUGET_DOWNLOAD_SOURCE" \
+          --no-restore
+      fi
+      dotnet restore \
+        --packages /tmp/nuget-global \
+        --source "$NUGET_DOWNLOAD_SOURCE" \
+        --verbosity normal
+    - |
+      # Copy downloaded .nupkg files to output folder
+      find /tmp/nuget-global -name '*.nupkg' -exec cp {} "$CI_PROJECT_DIR/downloaded-packages/" \;
+    - echo "=== Downloaded files ==="
+    - ls -lh "$CI_PROJECT_DIR/downloaded-packages/"
+  artifacts:
+    name: "nuget-download-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - downloaded-packages/
+    expire_in: 7 days
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
+      when: on_success
+    - when: manual
