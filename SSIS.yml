@@ -1,0 +1,415 @@
+# ================================================================
+# .gitlab-ci.yml  —  SSIS (SQL Server Integration Services)
+# Stages  : validate → build → test → publish-snapshot →
+#           publish-release → download
+#
+# Output  : .ispac file (Integration Services Project Archive)
+# Runner  : Windows shell runner with Visual Studio / SSDT installed
+#           SSDT (SQL Server Data Tools) required for dtproj builds
+#
+# Publish : snapshot  (feature/*, develop, master/main)
+#           release   (semver tag v1.2.3  —  manual gate)
+#
+# Artifactory: Generic repository (not NuGet) since .ispac is
+#              a binary archive, not a NuGet package.
+#              Optionally wrap in NuGet for uniformity — both
+#              approaches are shown.
+# ================================================================
+
+# ────────────────────────────────────────────────────────────────
+# REQUIRED CI/CD VARIABLES  (Settings → CI/CD → Variables)
+#
+#   ARTIFACTORY_URL               https://artifactory.company.com/artifactory
+#   ARTIFACTORY_SNAPSHOT_REPO     ssis-snapshot-local
+#   ARTIFACTORY_RELEASE_REPO      ssis-release-local
+#   ARTIFACTORY_USER              ← mask this
+#   ARTIFACTORY_PASSWORD          ← mask this
+#   ARTIFACTORY_API_KEY           ← mask this  (Artifactory API key / Identity Token)
+#
+#   SSIS_PROJECT_NAME             MySSISProject
+#
+# WINDOWS RUNNER SPECIFIC
+#   DEVENV_PATH   C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\IDE\devenv.com
+#   MSBUILD_PATH  C:\Program Files\Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\Bin\MSBuild.exe
+#
+# OPTIONAL  (download stage)
+#   SSIS_PACKAGE_VERSION          1.2.3  or  1.2.3-snapshot.123
+# ────────────────────────────────────────────────────────────────
+
+variables:
+  BUILD_CONFIGURATION: "Development"
+  SSIS_OUTPUT_DIR:     "bin"
+  ARTIFACTORY_SNAPSHOT_BASE: "$ARTIFACTORY_URL/$ARTIFACTORY_SNAPSHOT_REPO"
+  ARTIFACTORY_RELEASE_BASE:  "$ARTIFACTORY_URL/$ARTIFACTORY_RELEASE_REPO"
+
+stages:
+  - validate
+  - build
+  - test
+  - publish-snapshot
+  - publish-release
+  - download
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH =~ /^feature\/.*/'
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+    - if: '$CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
+
+# ── Shared before_script  (Windows shell runner) ──────────────
+.ssis_base:
+  tags:
+    - windows           # your Windows runner tag
+  before_script:
+    - echo "============================================"
+    - echo "  SSIS CI  (Windows Runner)"
+    - echo "============================================"
+    - |
+      IF NOT DEFINED MSBUILD_PATH (
+        SET "MSBUILD_PATH=C:\Program Files\Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\Bin\MSBuild.exe"
+      )
+      echo MSBuild ready
+      "%MSBUILD_PATH%" /version
+
+# ── Linux-compatible variant using curl for Artifactory REST ──
+.ssis_base_linux:
+  image: mcr.microsoft.com/dotnet/sdk:8.0
+  tags:
+    - linux             # ← your Linux runner tag
+  before_script:
+    - echo "============================================"
+    - echo "  SSIS Publish/Download  (Linux Runner)"
+    - echo "  Branch    $CI_COMMIT_REF_NAME"
+    - echo "  Commit    $CI_COMMIT_SHORT_SHA"
+    - echo "  Pipeline  $CI_PIPELINE_ID"
+    - echo "============================================"
+    - apt-get update -qq && apt-get install -y -qq curl jq unzip 2>/dev/null || true
+
+# ─────────────────────────────────────────────────────────────
+# VALIDATE  (Linux — checks repo structure)
+# ─────────────────────────────────────────────────────────────
+validate:
+  extends: .ssis_base_linux
+  stage: validate
+  script:
+    - echo "=== Validate SSIS project structure ==="
+    - |
+      DTPROJ=$(find . -name '*.dtproj' -not -path './.git/*' | head -1)
+      if [ -z "$DTPROJ" ]; then
+        echo "[ERROR] No .dtproj file found — is this an SSIS project?"
+        exit 1
+      fi
+      echo "  SSIS project : $DTPROJ"
+    - |
+      echo "  DTSX packages found:"
+      find . -name '*.dtsx' -not -path './.git/*' | sort
+    - |
+      # Check project params file
+      PARAMS=$(find . -name '*.params' -not -path './.git/*' | head -1)
+      if [ -n "$PARAMS" ]; then
+        echo "  Project params : $PARAMS"
+      fi
+    - echo "[OK] SSIS project structure is valid"
+  rules:
+    - if: '$CI_COMMIT_BRANCH || $CI_COMMIT_TAG'
+
+# ─────────────────────────────────────────────────────────────
+# BUILD  (Windows runner with SSDT / Visual Studio)
+# Produces: bin/Development/<ProjectName>.ispac
+# ─────────────────────────────────────────────────────────────
+build:
+  extends: .ssis_base
+  stage: build
+  script:
+    - echo "=== Build SSIS Project ==="
+    - |
+      FOR /F "delims=" %%f IN ('dir /s /b *.dtproj 2^>nul') DO SET DTPROJ=%%f
+      IF NOT DEFINED DTPROJ (
+        echo [ERROR] No .dtproj file found
+        exit /b 1
+      )
+      echo   Project : %DTPROJ%
+      echo   Config  : %BUILD_CONFIGURATION%
+    - |
+      REM Build using MSBuild with SSDT targets
+      "%MSBUILD_PATH%" "%DTPROJ%" ^
+        /p:Configuration="%BUILD_CONFIGURATION%" ^
+        /p:OutputPath="%SSIS_OUTPUT_DIR%\%BUILD_CONFIGURATION%" ^
+        /verbosity:normal ^
+        /nologo ^
+        /target:Build
+    - echo === Build output ===
+    - dir /s /b *.ispac 2>nul || echo (no .ispac found — check SSDT installation)
+    - dir "%SSIS_OUTPUT_DIR%\%BUILD_CONFIGURATION%\" 2>nul
+  artifacts:
+    name: "ssis-build-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - "bin/"
+    expire_in: 3 days
+  rules:
+    - if: '$CI_COMMIT_BRANCH || $CI_COMMIT_TAG'
+
+# ─────────────────────────────────────────────────────────────
+# TEST  (SSIS validation — runs dtexec against .dtsx packages)
+# ─────────────────────────────────────────────────────────────
+test:validate-packages:
+  extends: .ssis_base
+  stage: test
+  needs: [build]
+  script:
+    - echo "=== Validate SSIS Packages ==="
+    - |
+      REM Find dtexec for package validation
+      SET DTEXEC_PATH=C:\Program Files\Microsoft SQL Server\160\DTS\Binn\DTExec.exe
+      IF NOT EXIST "%DTEXEC_PATH%" (
+        SET DTEXEC_PATH=C:\Program Files (x86)\Microsoft SQL Server\160\DTS\Binn\DTExec.exe
+      )
+      IF NOT EXIST "%DTEXEC_PATH%" (
+        echo [WARN] dtexec not found — skipping package validation
+        exit /b 0
+      )
+      echo   dtexec : %DTEXEC_PATH%
+    - |
+      REM Validate each .dtsx package using /VALIDATE flag
+      SET FAIL=0
+      FOR /F "delims=" %%f IN ('dir /s /b *.dtsx 2^>nul') DO (
+        echo   Validating : %%f
+        "%DTEXEC_PATH%" /FILE "%%f" /VALIDATE
+        IF ERRORLEVEL 1 (
+          echo   [FAIL] %%f
+          SET FAIL=1
+        ) ELSE (
+          echo   [OK]   %%f
+        )
+      )
+      IF "%FAIL%"=="1" (
+        echo [ERROR] One or more SSIS packages failed validation
+        exit /b 1
+      )
+    - echo === All SSIS packages validated ===
+  artifacts:
+    when: always
+    paths:
+      - TestResults/
+    expire_in: 7 days
+  allow_failure: false
+  rules:
+    - if: '$CI_COMMIT_BRANCH || $CI_COMMIT_TAG'
+
+# ─────────────────────────────────────────────────────────────
+# PUBLISH SNAPSHOT  (Linux runner — curl to Artifactory REST API)
+# Auto-triggers on  feature/*, develop, master/main
+# Version : 1.2.3-snapshot.<pipeline-id>
+# Path    : <repo>/<project>/<version>/<project>-<version>.ispac
+# ─────────────────────────────────────────────────────────────
+publish:snapshot:
+  extends: .ssis_base_linux
+  stage: publish-snapshot
+  needs:
+    - job: build
+      artifacts: true
+    - job: test:validate-packages
+  script:
+    - echo "=== Publish SSIS Snapshot ==="
+    - |
+      DTPROJ=$(find . -name '*.dtproj' -not -path './.git/*' | head -1)
+      PROJECT_NAME=$(basename "$DTPROJ" .dtproj)
+
+      # Read version from .dtproj XML
+      BASE_VER=$(grep -oPm1 '(?<=<VersionMajor>)\d+' "$DTPROJ" 2>/dev/null || echo "1")
+      BASE_MIN=$(grep -oPm1 '(?<=<VersionMinor>)\d+' "$DTPROJ" 2>/dev/null || echo "0")
+      BASE_BLD=$(grep -oPm1 '(?<=<VersionBuild>)\d+' "$DTPROJ" 2>/dev/null || echo "0")
+      BASE_VER_FULL="${BASE_VER}.${BASE_MIN}.${BASE_BLD}"
+      SNAP_VER="${BASE_VER_FULL}-snapshot.${CI_PIPELINE_ID}"
+
+      echo "  Project  : $PROJECT_NAME"
+      echo "  Base     : $BASE_VER_FULL"
+      echo "  Snapshot : $SNAP_VER"
+      echo "  Repo     : $ARTIFACTORY_SNAPSHOT_REPO"
+
+      # Find .ispac file (could be in various build output locations)
+      ISPAC=$(find . -name '*.ispac' -not -path './.git/*' | head -1)
+      if [ -z "$ISPAC" ]; then
+        echo "[ERROR] No .ispac file found — did the build job run?"
+        exit 1
+      fi
+      echo "  ISPAC    : $ISPAC"
+
+      # Target path in Artifactory generic repo
+      TARGET_PATH="${PROJECT_NAME}/${SNAP_VER}/${PROJECT_NAME}-${SNAP_VER}.ispac"
+      UPLOAD_URL="${ARTIFACTORY_SNAPSHOT_BASE}/${TARGET_PATH}"
+
+      echo "  Upload → $UPLOAD_URL"
+
+      # Push to Artifactory using REST API
+      curl \
+        --fail \
+        --show-error \
+        --silent \
+        --request PUT \
+        --header "X-JFrog-Art-Api: $ARTIFACTORY_API_KEY" \
+        --header "X-Checksum-Deploy: false" \
+        --upload-file "$ISPAC" \
+        "$UPLOAD_URL"
+
+      # Also push a "latest-snapshot" alias
+      LATEST_URL="${ARTIFACTORY_SNAPSHOT_BASE}/${PROJECT_NAME}/latest-snapshot/${PROJECT_NAME}-latest-snapshot.ispac"
+      curl \
+        --fail \
+        --show-error \
+        --silent \
+        --request PUT \
+        --header "X-JFrog-Art-Api: $ARTIFACTORY_API_KEY" \
+        --upload-file "$ISPAC" \
+        "$LATEST_URL"
+
+      echo "=== Snapshot published ==="
+      echo "  $SNAP_VER → $ARTIFACTORY_SNAPSHOT_REPO/$TARGET_PATH"
+      echo "  Also at  → ${PROJECT_NAME}/latest-snapshot/"
+  environment:
+    name: ssis-snapshot
+    url: "$ARTIFACTORY_SNAPSHOT_BASE"
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^feature\/.*/'
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+    - if: '$CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"'
+
+# ─────────────────────────────────────────────────────────────
+# PUBLISH RELEASE  (Linux runner — curl to Artifactory REST API)
+# Only on tag v1.2.3  —  requires manual click in GitLab UI
+# ─────────────────────────────────────────────────────────────
+publish:release:
+  extends: .ssis_base_linux
+  stage: publish-release
+  needs:
+    - job: build
+      artifacts: true
+    - job: test:validate-packages
+  script:
+    - echo "=== Publish SSIS Release ==="
+    - |
+      RELEASE_VER="${CI_COMMIT_TAG#v}"
+
+      if ! echo "$RELEASE_VER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+        echo "[ERROR] Tag must be vX.Y.Z — got $CI_COMMIT_TAG"; exit 1
+      fi
+      if echo "$RELEASE_VER" | grep -qiE '(snapshot|dev|alpha|beta|rc)'; then
+        echo "[ERROR] Release tag must not contain pre-release identifiers"; exit 1
+      fi
+
+      DTPROJ=$(find . -name '*.dtproj' -not -path './.git/*' | head -1)
+      PROJECT_NAME=$(basename "$DTPROJ" .dtproj)
+
+      ISPAC=$(find . -name '*.ispac' -not -path './.git/*' | head -1)
+      if [ -z "$ISPAC" ]; then
+        echo "[ERROR] No .ispac file found — did the build job run?"
+        exit 1
+      fi
+
+      TARGET_PATH="${PROJECT_NAME}/${RELEASE_VER}/${PROJECT_NAME}-${RELEASE_VER}.ispac"
+      UPLOAD_URL="${ARTIFACTORY_RELEASE_BASE}/${TARGET_PATH}"
+
+      echo "  Project  : $PROJECT_NAME"
+      echo "  Version  : $RELEASE_VER"
+      echo "  ISPAC    : $ISPAC"
+      echo "  Upload → $UPLOAD_URL"
+
+      # Push versioned artifact
+      curl \
+        --fail \
+        --show-error \
+        --silent \
+        --request PUT \
+        --header "X-JFrog-Art-Api: $ARTIFACTORY_API_KEY" \
+        --upload-file "$ISPAC" \
+        "$UPLOAD_URL"
+
+      # Also push as latest release
+      LATEST_URL="${ARTIFACTORY_RELEASE_BASE}/${PROJECT_NAME}/latest/${PROJECT_NAME}-latest.ispac"
+      curl \
+        --fail \
+        --show-error \
+        --silent \
+        --request PUT \
+        --header "X-JFrog-Art-Api: $ARTIFACTORY_API_KEY" \
+        --upload-file "$ISPAC" \
+        "$LATEST_URL"
+
+      echo "=== Release published ==="
+      echo "  $RELEASE_VER → $ARTIFACTORY_RELEASE_REPO/$TARGET_PATH"
+      echo "  Also at  → ${PROJECT_NAME}/latest/"
+  environment:
+    name: ssis-release
+    url: "$ARTIFACTORY_RELEASE_BASE"
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
+      when: manual
+
+# ─────────────────────────────────────────────────────────────
+# DOWNLOAD  (Linux — curl from Artifactory REST API)
+# Set SSIS_PROJECT_NAME + SSIS_PACKAGE_VERSION in CI/CD vars
+# Auto on release tags; also available as manual trigger
+# ─────────────────────────────────────────────────────────────
+download:ispac:
+  extends: .ssis_base_linux
+  stage: download
+  needs: []
+  script:
+    - echo "=== Download SSIS .ispac ==="
+    - |
+      PKG_NAME="${SSIS_PROJECT_NAME:?Set SSIS_PROJECT_NAME in CI/CD variables}"
+      PKG_VER="${SSIS_PACKAGE_VERSION:-}"
+      echo "  Project  : $PKG_NAME"
+      echo "  Version  : ${PKG_VER:-latest}"
+      mkdir -p downloaded-packages
+    - |
+      if [ -n "$SSIS_PACKAGE_VERSION" ]; then
+        # Check if version is snapshot or release
+        if echo "$SSIS_PACKAGE_VERSION" | grep -qi 'snapshot'; then
+          REPO_BASE="$ARTIFACTORY_SNAPSHOT_BASE"
+        else
+          REPO_BASE="$ARTIFACTORY_RELEASE_BASE"
+        fi
+        FILENAME="${SSIS_PROJECT_NAME}-${SSIS_PACKAGE_VERSION}.ispac"
+        DOWNLOAD_URL="${REPO_BASE}/${SSIS_PROJECT_NAME}/${SSIS_PACKAGE_VERSION}/${FILENAME}"
+      else
+        # Download latest release
+        REPO_BASE="$ARTIFACTORY_RELEASE_BASE"
+        FILENAME="${SSIS_PROJECT_NAME}-latest.ispac"
+        DOWNLOAD_URL="${REPO_BASE}/${SSIS_PROJECT_NAME}/latest/${FILENAME}"
+      fi
+
+      echo "  URL      : $DOWNLOAD_URL"
+      echo "  Output   : downloaded-packages/$FILENAME"
+
+      curl \
+        --fail \
+        --show-error \
+        --silent \
+        --location \
+        --header "X-JFrog-Art-Api: $ARTIFACTORY_API_KEY" \
+        --output "downloaded-packages/$FILENAME" \
+        "$DOWNLOAD_URL"
+
+    - echo "=== Downloaded files ==="
+    - ls -lh downloaded-packages/
+    - |
+      # Verify .ispac is a valid ZIP archive (it is a ZIP-based format)
+      for F in downloaded-packages/*.ispac; do
+        [ -f "$F" ] || continue
+        echo "  Verifying : $F"
+        unzip -t "$F" 2>/dev/null && echo "  [OK] Valid .ispac archive" || echo "  [WARN] Could not verify"
+        echo "  Contents:"
+        unzip -l "$F" 2>/dev/null | head -20 || true
+      done
+  artifacts:
+    name: "ssis-download-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - downloaded-packages/
+    expire_in: 7 days
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
+      when: on_success
+    - when: manual
