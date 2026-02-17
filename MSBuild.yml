@@ -1,0 +1,483 @@
+# ================================================================
+# .gitlab-ci.yml  —  MSBuild / .NET Framework
+# Stages  : validate → restore → build → test →
+#           publish-snapshot → publish-release → download
+#
+# Runner  : Windows shell runner with MSBuild + NuGet CLI
+#           OR  mono-based Linux runner for cross-platform builds
+#
+# Publish : snapshot  (feature/*, develop, master/main)
+#           release   (semver tag v1.2.3  —  manual gate)
+# ================================================================
+
+# ────────────────────────────────────────────────────────────────
+# REQUIRED CI/CD VARIABLES  (Settings → CI/CD → Variables)
+#
+#   ARTIFACTORY_URL             https://artifactory.company.com/artifactory
+#   NUGET_SNAPSHOT_REPO         nuget-snapshot-local
+#   NUGET_RELEASE_REPO          nuget-release-local
+#   NUGET_VIRTUAL_REPO          nuget-virtual
+#   NUGET_API_KEY               ← mask this  (Artifactory API key)
+#   NUGET_USER                  ← mask this
+#   NUGET_PASSWORD              ← mask this
+#
+# WINDOWS RUNNER SPECIFIC  (if using Windows shell runner)
+#   MSBUILD_PATH                C:\Program Files\Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\Bin\MSBuild.exe
+#   NUGET_CLI_PATH              C:\tools\nuget.exe
+#
+# OPTIONAL  (download stage)
+#   NUGET_PACKAGE_ID            MyCompany.MyLibrary
+#   NUGET_PACKAGE_VERSION       1.2.3  or  1.2.3-snapshot.123
+# ────────────────────────────────────────────────────────────────
+
+variables:
+  NUGET_SNAPSHOT_SOURCE: "$ARTIFACTORY_URL/api/nuget/v3/$NUGET_SNAPSHOT_REPO/index.json"
+  NUGET_RELEASE_SOURCE:  "$ARTIFACTORY_URL/api/nuget/v3/$NUGET_RELEASE_REPO/index.json"
+  NUGET_DOWNLOAD_SOURCE: "$ARTIFACTORY_URL/api/nuget/v3/$NUGET_VIRTUAL_REPO/index.json"
+  BUILD_CONFIGURATION:   "Release"
+  BUILD_PLATFORM:        "Any CPU"
+
+cache:
+  key: "msbuild-$CI_COMMIT_REF_SLUG"
+  paths:
+    - packages/        # NuGet packages folder (packages.config style)
+    - .nuget/packages/ # SDK-style cache
+
+stages:
+  - validate
+  - restore
+  - build
+  - test
+  - publish-snapshot
+  - publish-release
+  - download
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH =~ /^feature\/.*/'
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+    - if: '$CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
+
+# ── Two runner tags:
+#    "windows"  → Windows shell runner with MSBuild installed
+#    "linux"    → Linux runner using mono/msbuild container
+#    Choose one block below and delete the other.
+
+# ─────────────────────────────────────────────────────────────
+# OPTION A: Windows Shell Runner
+# ─────────────────────────────────────────────────────────────
+
+.msbuild_base_windows:
+  tags:
+    - windows          # ← your Windows runner tag
+  before_script:
+    - echo "============================================"
+    - echo "  MSBuild CI  (Windows Runner)"
+    - echo "  Branch    %CI_COMMIT_REF_NAME%"
+    - echo "  Commit    %CI_COMMIT_SHORT_SHA%"
+    - echo "  Pipeline  %CI_PIPELINE_ID%"
+    - echo "============================================"
+    - |
+      REM Locate MSBuild
+      IF NOT DEFINED MSBUILD_PATH (
+        SET MSBUILD_PATH=C:\Program Files\Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\Bin\MSBuild.exe
+      )
+      "%MSBUILD_PATH%" /version
+    - |
+      REM Locate NuGet CLI
+      IF NOT DEFINED NUGET_CLI_PATH (
+        SET NUGET_CLI_PATH=C:\tools\nuget.exe
+      )
+      "%NUGET_CLI_PATH%" help | head -1
+    - |
+      REM Configure Artifactory as NuGet source
+      "%NUGET_CLI_PATH%" sources remove -Name ArtifactoryVirtual  2>NUL || EXIT /B 0
+      "%NUGET_CLI_PATH%" sources remove -Name ArtifactorySnapshot 2>NUL || EXIT /B 0
+      "%NUGET_CLI_PATH%" sources remove -Name ArtifactoryRelease  2>NUL || EXIT /B 0
+
+      "%NUGET_CLI_PATH%" sources add -Name ArtifactoryVirtual  -Source %NUGET_DOWNLOAD_SOURCE% -Username %NUGET_USER% -Password %NUGET_PASSWORD% -StorePasswordInClearText
+      "%NUGET_CLI_PATH%" sources add -Name ArtifactorySnapshot -Source %NUGET_SNAPSHOT_SOURCE% -Username %NUGET_USER% -Password %NUGET_PASSWORD% -StorePasswordInClearText
+      "%NUGET_CLI_PATH%" sources add -Name ArtifactoryRelease  -Source %NUGET_RELEASE_SOURCE%  -Username %NUGET_USER% -Password %NUGET_PASSWORD% -StorePasswordInClearText
+    - echo [OK] NuGet sources configured
+
+# ─────────────────────────────────────────────────────────────
+# OPTION B: Linux Runner  (mono + msbuild container)
+# ─────────────────────────────────────────────────────────────
+
+.msbuild_base_linux:
+  image: mono:latest    # or use mcr.microsoft.com/dotnet/sdk:8.0 for SDK-style
+  tags:
+    - linux             # ← your Linux runner tag
+  before_script:
+    - echo "============================================"
+    - echo "  MSBuild CI  (Linux / Mono Runner)"
+    - echo "  Mono      $(mono --version | head -1)"
+    - echo "  MSBuild   $(msbuild /version 2>/dev/null | tail -1)"
+    - echo "  Branch    $CI_COMMIT_REF_NAME"
+    - echo "  Commit    $CI_COMMIT_SHORT_SHA"
+    - echo "  Pipeline  $CI_PIPELINE_ID"
+    - echo "============================================"
+    - |
+      # Install NuGet CLI if not present
+      if ! command -v nuget &>/dev/null; then
+        apt-get update -qq && apt-get install -y -qq nuget 2>/dev/null || \
+        curl -sSL https://dist.nuget.org/win-x86-commandline/latest/nuget.exe \
+          -o /usr/local/bin/nuget.exe
+        alias nuget='mono /usr/local/bin/nuget.exe' 2>/dev/null || true
+      fi
+    - |
+      # Configure Artifactory NuGet sources
+      nuget sources remove -Name "ArtifactoryVirtual"  2>/dev/null || true
+      nuget sources remove -Name "ArtifactorySnapshot" 2>/dev/null || true
+      nuget sources remove -Name "ArtifactoryRelease"  2>/dev/null || true
+
+      nuget sources add \
+        -Name "ArtifactoryVirtual" \
+        -Source "$NUGET_DOWNLOAD_SOURCE" \
+        -Username "$NUGET_USER" \
+        -Password "$NUGET_PASSWORD" \
+        -StorePasswordInClearText
+
+      nuget sources add \
+        -Name "ArtifactorySnapshot" \
+        -Source "$NUGET_SNAPSHOT_SOURCE" \
+        -Username "$NUGET_USER" \
+        -Password "$NUGET_PASSWORD" \
+        -StorePasswordInClearText
+
+      nuget sources add \
+        -Name "ArtifactoryRelease" \
+        -Source "$NUGET_RELEASE_SOURCE" \
+        -Username "$NUGET_USER" \
+        -Password "$NUGET_PASSWORD" \
+        -StorePasswordInClearText
+    - echo "[OK] NuGet sources configured"
+    - nuget sources list
+
+# ── Active template: change to .msbuild_base_windows if needed
+.msbuild_base:
+  extends: .msbuild_base_linux
+
+# ─────────────────────────────────────────────────────────────
+# VALIDATE
+# ─────────────────────────────────────────────────────────────
+validate:
+  extends: .msbuild_base
+  stage: validate
+  script:
+    - echo "=== Validate MSBuild project structure ==="
+    - |
+      SLN=$(find . -name '*.sln' -not -path './.git/*' | head -1)
+      if [ -z "$SLN" ]; then
+        echo "[ERROR] No .sln file found"
+        exit 1
+      fi
+      echo "  Solution : $SLN"
+    - |
+      echo "  Projects found:"
+      find . -name '*.csproj' -not -path './.git/*' | sort
+      find . -name '*.vbproj' -not -path './.git/*' | sort
+    - echo "[OK] Project structure is valid"
+  rules:
+    - if: '$CI_COMMIT_BRANCH || $CI_COMMIT_TAG'
+
+# ─────────────────────────────────────────────────────────────
+# RESTORE
+# ─────────────────────────────────────────────────────────────
+restore:
+  extends: .msbuild_base
+  stage: restore
+  script:
+    - echo "=== Restore NuGet packages ==="
+    - SLN=$(find . -name '*.sln' -not -path './.git/*' | head -1)
+    - echo "  Restoring : $SLN"
+    - |
+      nuget restore "$SLN" \
+        -Source "$NUGET_DOWNLOAD_SOURCE" \
+        -Verbosity detailed \
+        -NonInteractive
+    - echo "[OK] Packages restored"
+    - ls -lh packages/ 2>/dev/null || echo "(packages in NuGet global cache)"
+  artifacts:
+    paths:
+      - packages/
+    expire_in: 1 hour
+  rules:
+    - if: '$CI_COMMIT_BRANCH || $CI_COMMIT_TAG'
+
+# ─────────────────────────────────────────────────────────────
+# BUILD
+# ─────────────────────────────────────────────────────────────
+build:
+  extends: .msbuild_base
+  stage: build
+  needs: [restore]
+  script:
+    - echo "=== MSBuild ==="
+    - SLN=$(find . -name '*.sln' -not -path './.git/*' | head -1)
+    - echo "  Solution  : $SLN"
+    - echo "  Config    : $BUILD_CONFIGURATION"
+    - echo "  Platform  : $BUILD_PLATFORM"
+    - |
+      msbuild "$SLN" \
+        /p:Configuration="$BUILD_CONFIGURATION" \
+        /p:Platform="$BUILD_PLATFORM" \
+        /p:RestorePackages=false \
+        /m \
+        /verbosity:normal \
+        /nologo
+    - echo "=== Build output ==="
+    - find . -name '*.dll' -path "*/bin/$BUILD_CONFIGURATION/*" -not -path './.git/*' | sort
+    - find . -name '*.exe' -path "*/bin/$BUILD_CONFIGURATION/*" -not -path './.git/*' | sort
+  artifacts:
+    name: "msbuild-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - "**/bin/$BUILD_CONFIGURATION/"
+      - "**/obj/$BUILD_CONFIGURATION/"
+    expire_in: 3 days
+  rules:
+    - if: '$CI_COMMIT_BRANCH || $CI_COMMIT_TAG'
+
+# ─────────────────────────────────────────────────────────────
+# TEST  (MSTest / NUnit / xUnit via vstest.console or dotnet test)
+# ─────────────────────────────────────────────────────────────
+test:
+  extends: .msbuild_base
+  stage: test
+  needs: [build]
+  script:
+    - echo "=== Run Tests ==="
+    - |
+      # Find test assemblies
+      TEST_DLLS=$(find . -name '*Test*.dll' -path "*/bin/$BUILD_CONFIGURATION/*" \
+        -not -path './.git/*' \
+        -not -name 'nunit.framework.dll' \
+        -not -name 'xunit.*.dll' | tr '\n' ' ')
+
+      if [ -z "$TEST_DLLS" ]; then
+        echo "[SKIP] No test assemblies found — looked for *Test*.dll"
+      else
+        echo "  Test DLLs : $TEST_DLLS"
+        # vstest.console (Windows runner)
+        if command -v vstest.console.exe &>/dev/null; then
+          vstest.console.exe $TEST_DLLS \
+            /Logger:"trx;LogFileName=TestResults.trx" \
+            /ResultsDirectory:./TestResults
+        # mono nunit runner (Linux)
+        elif command -v nunit3-console &>/dev/null; then
+          nunit3-console $TEST_DLLS \
+            --result=TestResults/nunit-results.xml
+        else
+          echo "[WARN] No test runner found — skipping test execution"
+        fi
+      fi
+    - echo "=== Test results ==="
+    - ls -lh TestResults/ 2>/dev/null || echo "(no test results)"
+  artifacts:
+    when: always
+    reports:
+      junit: "TestResults/*.xml"
+    paths:
+      - TestResults/
+    expire_in: 7 days
+  allow_failure: false
+  rules:
+    - if: '$CI_COMMIT_BRANCH || $CI_COMMIT_TAG'
+
+# ─────────────────────────────────────────────────────────────
+# PUBLISH SNAPSHOT
+# Auto-triggers on  feature/*, develop, master/main
+# Version : 1.2.3-snapshot.<pipeline-id>
+# ─────────────────────────────────────────────────────────────
+publish:snapshot:
+  extends: .msbuild_base
+  stage: publish-snapshot
+  needs:
+    - job: build
+    - job: test
+  script:
+    - echo "=== Publish Snapshot ==="
+    - |
+      NUSPEC=$(find . -name '*.nuspec' -not -path './.git/*' | head -1)
+      CSPROJ=$(find . -name '*.csproj' \
+        -not -path './.git/*' \
+        -not -name '*.Test.csproj' \
+        -not -name '*.Tests.csproj' | head -1)
+
+      if [ -n "$NUSPEC" ]; then
+        BASE_VER=$(grep -oPm1 '(?<=<version>)[^<]+' "$NUSPEC" 2>/dev/null || echo "1.0.0")
+        SOURCE_FILE="$NUSPEC"
+        echo "  Using nuspec : $NUSPEC"
+      elif [ -n "$CSPROJ" ]; then
+        BASE_VER=$(grep -oPm1 '(?<=<Version>)[^<]+' "$CSPROJ" 2>/dev/null || \
+                   grep -oPm1 '(?<=<VersionPrefix>)[^<]+' "$CSPROJ" 2>/dev/null || echo "1.0.0")
+        SOURCE_FILE="$CSPROJ"
+        echo "  Using csproj : $CSPROJ"
+      else
+        echo "[ERROR] No .nuspec or .csproj found"; exit 1
+      fi
+
+      CLEAN_VER=$(echo "$BASE_VER" | sed 's/-[a-zA-Z].*//')
+      SNAP_VER="${CLEAN_VER}-snapshot.${CI_PIPELINE_ID}"
+      echo "  Base     : $BASE_VER"
+      echo "  Snapshot : $SNAP_VER"
+      echo "  Repo     : $NUGET_SNAPSHOT_REPO"
+    - mkdir -p ./nupkgs
+    - |
+      # Pack using nuget CLI
+      if [ -n "$NUSPEC" ]; then
+        nuget pack "$NUSPEC" \
+          -Version "$SNAP_VER" \
+          -OutputDirectory ./nupkgs \
+          -NonInteractive \
+          -Verbosity detailed
+      else
+        nuget pack "$CSPROJ" \
+          -Version "$SNAP_VER" \
+          -OutputDirectory ./nupkgs \
+          -Properties Configuration=$BUILD_CONFIGURATION \
+          -NonInteractive \
+          -Verbosity detailed
+      fi
+    - echo "=== Packages ready ==="
+    - ls -lh ./nupkgs/
+    - |
+      for NUPKG in ./nupkgs/*.nupkg; do
+        echo "  Pushing : $NUPKG"
+        nuget push "$NUPKG" \
+          -Source "$NUGET_SNAPSHOT_SOURCE" \
+          -ApiKey "$NUGET_API_KEY" \
+          -SkipDuplicate \
+          -NonInteractive
+      done
+    - echo "=== Snapshot published ==="
+    - echo "  $SNAP_VER → $NUGET_SNAPSHOT_REPO"
+  artifacts:
+    name: "nuget-snapshot-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - nupkgs/
+    expire_in: 7 days
+  environment:
+    name: nuget-snapshot
+    url: "$NUGET_SNAPSHOT_SOURCE"
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^feature\/.*/'
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+    - if: '$CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"'
+
+# ─────────────────────────────────────────────────────────────
+# PUBLISH RELEASE
+# Only on tag v1.2.3  —  requires manual click in GitLab UI
+# ─────────────────────────────────────────────────────────────
+publish:release:
+  extends: .msbuild_base
+  stage: publish-release
+  needs:
+    - job: build
+    - job: test
+  script:
+    - echo "=== Publish Release ==="
+    - |
+      RELEASE_VER="${CI_COMMIT_TAG#v}"
+      if ! echo "$RELEASE_VER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+        echo "[ERROR] Tag must be vX.Y.Z — got $CI_COMMIT_TAG"; exit 1
+      fi
+      if echo "$RELEASE_VER" | grep -qiE '(snapshot|dev|alpha|beta|rc)'; then
+        echo "[ERROR] Release tag must not contain pre-release identifiers"; exit 1
+      fi
+
+      NUSPEC=$(find . -name '*.nuspec' -not -path './.git/*' | head -1)
+      CSPROJ=$(find . -name '*.csproj' \
+        -not -path './.git/*' \
+        -not -name '*.Test.csproj' \
+        -not -name '*.Tests.csproj' | head -1)
+
+      echo "  Version  : $RELEASE_VER"
+      echo "  Repo     : $NUGET_RELEASE_REPO"
+    - mkdir -p ./nupkgs
+    - |
+      if [ -n "$NUSPEC" ]; then
+        nuget pack "$NUSPEC" \
+          -Version "$RELEASE_VER" \
+          -OutputDirectory ./nupkgs \
+          -NonInteractive \
+          -Verbosity detailed
+      else
+        nuget pack "$CSPROJ" \
+          -Version "$RELEASE_VER" \
+          -OutputDirectory ./nupkgs \
+          -Properties Configuration=$BUILD_CONFIGURATION \
+          -NonInteractive \
+          -Verbosity detailed
+      fi
+    - echo "=== Packages ready ==="
+    - ls -lh ./nupkgs/
+    - |
+      for NUPKG in ./nupkgs/*.nupkg; do
+        echo "  Pushing : $NUPKG"
+        nuget push "$NUPKG" \
+          -Source "$NUGET_RELEASE_SOURCE" \
+          -ApiKey "$NUGET_API_KEY" \
+          -SkipDuplicate \
+          -NonInteractive
+      done
+    - echo "=== Release published ==="
+    - echo "  $RELEASE_VER → $NUGET_RELEASE_REPO"
+  artifacts:
+    name: "nuget-release-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - nupkgs/
+    expire_in: 90 days
+  environment:
+    name: nuget-release
+    url: "$NUGET_RELEASE_SOURCE"
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
+      when: manual
+
+# ─────────────────────────────────────────────────────────────
+# DOWNLOAD
+# Set NUGET_PACKAGE_ID + NUGET_PACKAGE_VERSION in CI/CD vars
+# Auto on release tags; also available as manual trigger
+# ─────────────────────────────────────────────────────────────
+download:package:
+  extends: .msbuild_base
+  stage: download
+  needs: []
+  script:
+    - echo "=== Download NuGet Package ==="
+    - |
+      PKG_ID="${NUGET_PACKAGE_ID:?Set NUGET_PACKAGE_ID in CI/CD variables}"
+      PKG_VER="${NUGET_PACKAGE_VERSION:-}"
+      echo "  Package : $PKG_ID"
+      echo "  Version : ${PKG_VER:-latest}"
+      echo "  Source  : $NUGET_DOWNLOAD_SOURCE"
+      mkdir -p downloaded-packages
+    - |
+      if [ -n "$NUGET_PACKAGE_VERSION" ]; then
+        nuget install "$NUGET_PACKAGE_ID" \
+          -Version "$NUGET_PACKAGE_VERSION" \
+          -Source "$NUGET_DOWNLOAD_SOURCE" \
+          -OutputDirectory ./downloaded-packages \
+          -NonInteractive \
+          -Verbosity detailed
+      else
+        nuget install "$NUGET_PACKAGE_ID" \
+          -Source "$NUGET_DOWNLOAD_SOURCE" \
+          -OutputDirectory ./downloaded-packages \
+          -NonInteractive \
+          -Verbosity detailed
+      fi
+    - echo "=== Downloaded packages ==="
+    - ls -lh downloaded-packages/
+  artifacts:
+    name: "nuget-download-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - downloaded-packages/
+    expire_in: 7 days
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
+      when: on_success
+    - when: manual
