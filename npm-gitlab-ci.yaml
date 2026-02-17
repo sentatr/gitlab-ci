@@ -1,0 +1,605 @@
+# .gitlab-ci.yml for NPM/Node.js Projects
+# Supports Node 16, 18, 22, 24 with Build, Test, and Publish stages
+# Includes artifact download capabilities
+
+variables:
+  # NPM/Artifactory Configuration (Set in GitLab CI/CD Variables)
+  # NPM_REGISTRY_URL: "https://artifactory.company.com/artifactory/api/npm/npm-local/"
+  # NPM_REGISTRY_HOST: "artifactory.company.com"
+  # NPM_AUTH_TOKEN: (masked variable - Artifactory API key)
+  # NPM_SNAPSHOT_REPO: "npm-snapshot-local"
+  # NPM_RELEASE_REPO: "npm-release-local"
+  
+  # Cache configuration
+  npm_config_cache: "$CI_PROJECT_DIR/.npm"
+  
+  # Disable npm update check
+  NO_UPDATE_NOTIFIER: "true"
+  
+  # Use CI-friendly output
+  CI: "true"
+
+# Cache dependencies for faster builds
+cache:
+  key:
+    files:
+      - package-lock.json
+  paths:
+    - .npm/
+    - node_modules/
+
+# Pipeline stages
+stages:
+  - setup
+  - build
+  - test
+  - publish
+  - download-artifacts
+
+# Workflow rules
+workflow:
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^feature\/.*/'
+      variables:
+        DEPLOY_ENV: "snapshot"
+    - if: '$CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop"'
+      variables:
+        DEPLOY_ENV: "snapshot"
+    - if: '$CI_COMMIT_TAG =~ /^v?[0-9]+\.[0-9]+\.[0-9]+.*/'
+      variables:
+        DEPLOY_ENV: "release"
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      variables:
+        DEPLOY_ENV: "none"
+
+# ==============================================================================
+# TEMPLATE: Common NPM Setup
+# ==============================================================================
+
+.npm_setup:
+  before_script:
+    - echo "=========================================="
+    - echo "NPM Build Information"
+    - echo "=========================================="
+    - echo "Node Version: $(node --version)"
+    - echo "NPM Version: $(npm --version)"
+    - echo "Branch/Tag: ${CI_COMMIT_REF_NAME}"
+    - echo "Commit SHA: ${CI_COMMIT_SHORT_SHA}"
+    - echo "Deploy Environment: ${DEPLOY_ENV}"
+    - echo "=========================================="
+    - |
+      # Configure .npmrc with Artifactory credentials
+      if [ -f ".npmrc" ]; then
+        echo "Using .npmrc from repository"
+        # Substitute environment variables
+        sed -i "s|\${NPM_REGISTRY_URL}|${NPM_REGISTRY_URL}|g" .npmrc
+        sed -i "s|\${NPM_REGISTRY_HOST}|${NPM_REGISTRY_HOST}|g" .npmrc
+        sed -i "s|\${NPM_AUTH_TOKEN}|${NPM_AUTH_TOKEN}|g" .npmrc
+      else
+        echo "Creating .npmrc dynamically"
+        cat > .npmrc <<EOF
+      registry=${NPM_REGISTRY_URL}
+      always-auth=true
+      //${NPM_REGISTRY_HOST}/:_authToken=${NPM_AUTH_TOKEN}
+      EOF
+      fi
+    - npm config list
+    - echo "NPM configuration complete"
+
+# ==============================================================================
+# SETUP STAGE - Install Dependencies
+# ==============================================================================
+
+# Install for Node 16
+setup:node16:
+  extends: .npm_setup
+  stage: setup
+  image: node:16-alpine
+  script:
+    - echo "Installing dependencies for Node 16..."
+    - npm ci
+    - echo "Dependencies installed successfully"
+  artifacts:
+    paths:
+      - node_modules/
+    expire_in: 1 hour
+  rules:
+    - if: '$DEPLOY_ENV != "none"'
+
+# Install for Node 18
+setup:node18:
+  extends: .npm_setup
+  stage: setup
+  image: node:18-alpine
+  script:
+    - echo "Installing dependencies for Node 18..."
+    - npm ci
+    - echo "Dependencies installed successfully"
+  artifacts:
+    paths:
+      - node_modules/
+    expire_in: 1 hour
+  rules:
+    - if: '$DEPLOY_ENV != "none"'
+
+# Install for Node 22
+setup:node22:
+  extends: .npm_setup
+  stage: setup
+  image: node:22-alpine
+  script:
+    - echo "Installing dependencies for Node 22..."
+    - npm ci
+    - echo "Dependencies installed successfully"
+  artifacts:
+    paths:
+      - node_modules/
+    expire_in: 1 hour
+  rules:
+    - if: '$DEPLOY_ENV != "none"'
+
+# Install for Node 24 (LTS when available)
+setup:node24:
+  extends: .npm_setup
+  stage: setup
+  image: node:24-alpine
+  allow_failure: true  # Node 24 might not be available yet
+  script:
+    - echo "Installing dependencies for Node 24..."
+    - npm ci
+    - echo "Dependencies installed successfully"
+  artifacts:
+    paths:
+      - node_modules/
+    expire_in: 1 hour
+  rules:
+    - if: '$DEPLOY_ENV != "none"'
+
+# ==============================================================================
+# BUILD STAGE - Build the Package
+# ==============================================================================
+
+# Build with Node 16
+build:node16:
+  extends: .npm_setup
+  stage: build
+  image: node:16-alpine
+  dependencies:
+    - setup:node16
+  script:
+    - echo "Building with Node 16..."
+    - |
+      if [ -f "package.json" ] && grep -q '"build"' package.json; then
+        npm run build
+      else
+        echo "No build script found, skipping..."
+      fi
+    - echo "Build completed successfully"
+  artifacts:
+    paths:
+      - dist/
+      - build/
+      - lib/
+      - .next/
+    expire_in: 1 day
+  rules:
+    - if: '$DEPLOY_ENV != "none"'
+
+# Build with Node 18
+build:node18:
+  extends: .npm_setup
+  stage: build
+  image: node:18-alpine
+  dependencies:
+    - setup:node18
+  script:
+    - echo "Building with Node 18..."
+    - |
+      if [ -f "package.json" ] && grep -q '"build"' package.json; then
+        npm run build
+      else
+        echo "No build script found, skipping..."
+      fi
+    - echo "Build completed successfully"
+  artifacts:
+    paths:
+      - dist/
+      - build/
+      - lib/
+      - .next/
+    expire_in: 1 day
+  rules:
+    - if: '$DEPLOY_ENV != "none"'
+
+# Build with Node 22
+build:node22:
+  extends: .npm_setup
+  stage: build
+  image: node:22-alpine
+  dependencies:
+    - setup:node22
+  script:
+    - echo "Building with Node 22..."
+    - |
+      if [ -f "package.json" ] && grep -q '"build"' package.json; then
+        npm run build
+      else
+        echo "No build script found, skipping..."
+      fi
+    - echo "Build completed successfully"
+  artifacts:
+    paths:
+      - dist/
+      - build/
+      - lib/
+      - .next/
+    expire_in: 1 day
+  rules:
+    - if: '$DEPLOY_ENV != "none"'
+
+# ==============================================================================
+# TEST STAGE - Run Tests on Multiple Node Versions
+# ==============================================================================
+
+# Test with Node 16
+test:node16:
+  extends: .npm_setup
+  stage: test
+  image: node:16-alpine
+  dependencies:
+    - setup:node16
+    - build:node16
+  script:
+    - echo "Running tests with Node 16..."
+    - |
+      if [ -f "package.json" ] && grep -q '"test"' package.json; then
+        npm run test -- --coverage --ci
+      else
+        echo "No test script found, skipping..."
+      fi
+  artifacts:
+    when: always
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura-coverage.xml
+      junit: junit.xml
+    paths:
+      - coverage/
+    expire_in: 7 days
+  coverage: '/All files[^|]*\|[^|]*\s+([\d\.]+)/'
+  rules:
+    - if: '$DEPLOY_ENV != "none"'
+
+# Test with Node 18
+test:node18:
+  extends: .npm_setup
+  stage: test
+  image: node:18-alpine
+  dependencies:
+    - setup:node18
+    - build:node18
+  script:
+    - echo "Running tests with Node 18..."
+    - |
+      if [ -f "package.json" ] && grep -q '"test"' package.json; then
+        npm run test -- --coverage --ci
+      else
+        echo "No test script found, skipping..."
+      fi
+  artifacts:
+    when: always
+    paths:
+      - coverage/
+    expire_in: 7 days
+  coverage: '/All files[^|]*\|[^|]*\s+([\d\.]+)/'
+  rules:
+    - if: '$DEPLOY_ENV != "none"'
+
+# Test with Node 22
+test:node22:
+  extends: .npm_setup
+  stage: test
+  image: node:22-alpine
+  dependencies:
+    - setup:node22
+    - build:node22
+  script:
+    - echo "Running tests with Node 22..."
+    - |
+      if [ -f "package.json" ] && grep -q '"test"' package.json; then
+        npm run test -- --coverage --ci
+      else
+        echo "No test script found, skipping..."
+      fi
+  artifacts:
+    when: always
+    paths:
+      - coverage/
+    expire_in: 7 days
+  coverage: '/All files[^|]*\|[^|]*\s+([\d\.]+)/'
+  rules:
+    - if: '$DEPLOY_ENV != "none"'
+
+# ==============================================================================
+# LINT STAGE (Optional)
+# ==============================================================================
+
+lint:
+  extends: .npm_setup
+  stage: test
+  image: node:18-alpine
+  dependencies:
+    - setup:node18
+  script:
+    - echo "Running linter..."
+    - |
+      if [ -f "package.json" ] && grep -q '"lint"' package.json; then
+        npm run lint
+      else
+        echo "No lint script found, skipping..."
+      fi
+  rules:
+    - if: '$DEPLOY_ENV != "none"'
+
+# ==============================================================================
+# PUBLISH STAGE - Publish to Artifactory
+# ==============================================================================
+
+# Publish SNAPSHOT (development) packages
+publish:snapshot:
+  extends: .npm_setup
+  stage: publish
+  image: node:18-alpine
+  dependencies:
+    - build:node18
+  script:
+    - echo "=========================================="
+    - echo "Publishing SNAPSHOT to Artifactory"
+    - echo "=========================================="
+    - |
+      # Get current version from package.json
+      CURRENT_VERSION=$(node -p "require('./package.json').version")
+      echo "Current version: ${CURRENT_VERSION}"
+      
+      # Ensure version has pre-release identifier for snapshots
+      if [[ ! "${CURRENT_VERSION}" =~ -(alpha|beta|rc|SNAPSHOT|dev) ]]; then
+        # Add snapshot identifier with timestamp
+        TIMESTAMP=$(date +%Y%m%d%H%M%S)
+        NEW_VERSION="${CURRENT_VERSION}-SNAPSHOT.${TIMESTAMP}"
+        echo "Adding snapshot identifier: ${NEW_VERSION}"
+        npm version "${NEW_VERSION}" --no-git-tag-version
+        CURRENT_VERSION="${NEW_VERSION}"
+      fi
+      
+      echo "Final version: ${CURRENT_VERSION}"
+    - |
+      # Configure npm for publishing to snapshot repository
+      npm config set registry ${NPM_REGISTRY_URL}
+      npm config set //${NPM_REGISTRY_HOST}/:_authToken ${NPM_AUTH_TOKEN}
+    - echo "Publishing package to snapshot repository..."
+    - npm publish --tag snapshot
+    - echo "=========================================="
+    - echo "Deployment Summary:"
+    - echo "  Package: $(node -p "require('./package.json').name")"
+    - echo "  Version: ${CURRENT_VERSION}"
+    - echo "  Repository: ${NPM_SNAPSHOT_REPO}"
+    - echo "  Registry: ${NPM_REGISTRY_URL}"
+    - echo "  Tag: snapshot"
+    - echo "=========================================="
+  rules:
+    - if: '$DEPLOY_ENV == "snapshot" && ($CI_COMMIT_BRANCH =~ /^feature\/.*/ || $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop")'
+  environment:
+    name: npm-snapshot
+    url: ${NPM_REGISTRY_URL}
+
+# Publish RELEASE packages
+publish:release:
+  extends: .npm_setup
+  stage: publish
+  image: node:18-alpine
+  dependencies:
+    - build:node18
+  script:
+    - echo "=========================================="
+    - echo "Publishing RELEASE to Artifactory"
+    - echo "=========================================="
+    - |
+      # Extract version from tag (remove 'v' prefix if exists)
+      RELEASE_VERSION="${CI_COMMIT_TAG#v}"
+      echo "Tag: ${CI_COMMIT_TAG}"
+      echo "Release version: ${RELEASE_VERSION}"
+      
+      # Validate version format (semantic versioning)
+      if [[ ! "${RELEASE_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+        echo "ERROR: Invalid version format. Expected format: v1.0.0 or 1.0.0"
+        exit 1
+      fi
+      
+      # Ensure version does NOT have pre-release identifier
+      if [[ "${RELEASE_VERSION}" =~ -(alpha|beta|rc|SNAPSHOT|dev) ]]; then
+        echo "ERROR: Release version cannot contain pre-release identifiers"
+        exit 1
+      fi
+      
+      # Update package.json version
+      npm version "${RELEASE_VERSION}" --no-git-tag-version --allow-same-version
+    - |
+      # Configure npm for publishing to release repository
+      npm config set registry ${NPM_REGISTRY_URL}
+      npm config set //${NPM_REGISTRY_HOST}/:_authToken ${NPM_AUTH_TOKEN}
+    - echo "Publishing package to release repository..."
+    - npm publish --tag latest
+    - echo "=========================================="
+    - echo "Deployment Summary:"
+    - echo "  Package: $(node -p "require('./package.json').name")"
+    - echo "  Version: ${RELEASE_VERSION}"
+    - echo "  Repository: ${NPM_RELEASE_REPO}"
+    - echo "  Registry: ${NPM_REGISTRY_URL}"
+    - echo "  Git Tag: ${CI_COMMIT_TAG}"
+    - echo "  Tag: latest"
+    - echo "=========================================="
+  rules:
+    - if: '$DEPLOY_ENV == "release" && $CI_COMMIT_TAG =~ /^v?[0-9]+\.[0-9]+\.[0-9]+.*/'
+  environment:
+    name: npm-production
+    url: ${NPM_REGISTRY_URL}
+  only:
+    - tags
+
+# ==============================================================================
+# DOWNLOAD ARTIFACTS STAGE - Download Published Packages
+# ==============================================================================
+
+# Download from NPM registry (for verification or deployment)
+download:npm-package:
+  stage: download-artifacts
+  image: node:18-alpine
+  before_script:
+    - echo "=========================================="
+    - echo "Downloading NPM Package from Artifactory"
+    - echo "=========================================="
+    - |
+      # Configure .npmrc for downloading
+      cat > .npmrc <<EOF
+      registry=${NPM_REGISTRY_URL}
+      always-auth=true
+      //${NPM_REGISTRY_HOST}/:_authToken=${NPM_AUTH_TOKEN}
+      EOF
+  script:
+    - |
+      # Get package name and version
+      PACKAGE_NAME=$(node -p "require('./package.json').name" 2>/dev/null || echo "${CI_PROJECT_NAME}")
+      
+      # Determine version to download
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        PACKAGE_VERSION="${CI_COMMIT_TAG#v}"
+      else
+        # Get latest version from registry
+        PACKAGE_VERSION=$(npm view ${PACKAGE_NAME} version 2>/dev/null || echo "latest")
+      fi
+      
+      echo "Package: ${PACKAGE_NAME}"
+      echo "Version: ${PACKAGE_VERSION}"
+      
+      # Create download directory
+      mkdir -p downloaded-packages
+      cd downloaded-packages
+      
+      # Download package
+      echo "Downloading package..."
+      npm pack ${PACKAGE_NAME}@${PACKAGE_VERSION}
+      
+      # Extract package
+      echo "Extracting package..."
+      tar -xzf *.tgz
+      
+      # List contents
+      echo "=========================================="
+      echo "Downloaded Package Contents:"
+      ls -lah package/
+      echo "=========================================="
+  artifacts:
+    paths:
+      - downloaded-packages/
+    expire_in: 7 days
+  rules:
+    - if: '$CI_COMMIT_TAG || $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"'
+      when: manual
+  environment:
+    name: package-download
+
+# Download specific artifact by URL
+download:artifact-by-url:
+  stage: download-artifacts
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache curl jq
+  script:
+    - echo "=========================================="
+    - echo "Downloading Artifact from Artifactory"
+    - echo "=========================================="
+    - |
+      # Example: Download a specific artifact by URL
+      # Set ARTIFACT_URL in GitLab CI/CD variables or pass as parameter
+      
+      if [ -z "$ARTIFACT_URL" ]; then
+        echo "ERROR: ARTIFACT_URL not set"
+        echo "Please set ARTIFACT_URL variable with the full path to the artifact"
+        echo "Example: https://artifactory.company.com/artifactory/npm-local/my-package/-/my-package-1.0.0.tgz"
+        exit 1
+      fi
+      
+      echo "Artifact URL: ${ARTIFACT_URL}"
+      
+      # Create download directory
+      mkdir -p artifacts
+      cd artifacts
+      
+      # Download with authentication
+      echo "Downloading artifact..."
+      curl -u "${NPM_REGISTRY_USER}:${NPM_REGISTRY_PASSWORD}" \
+        -L -O "${ARTIFACT_URL}"
+      
+      # List downloaded files
+      echo "=========================================="
+      echo "Downloaded Files:"
+      ls -lah
+      echo "=========================================="
+  artifacts:
+    paths:
+      - artifacts/
+    expire_in: 7 days
+  rules:
+    - when: manual
+  environment:
+    name: artifact-download
+
+# Download from GitLab Package Registry
+download:gitlab-package:
+  stage: download-artifacts
+  image: node:18-alpine
+  before_script:
+    - apk add --no-cache curl
+  script:
+    - echo "=========================================="
+    - echo "Downloading from GitLab Package Registry"
+    - echo "=========================================="
+    - |
+      # GitLab Package Registry API endpoint
+      PROJECT_ID=${CI_PROJECT_ID}
+      PACKAGE_NAME=$(node -p "require('./package.json').name" 2>/dev/null || echo "${CI_PROJECT_NAME}")
+      
+      # List available packages
+      echo "Available packages:"
+      curl --header "PRIVATE-TOKEN: ${CI_JOB_TOKEN}" \
+        "${CI_API_V4_URL}/projects/${PROJECT_ID}/packages" | jq '.'
+      
+      # Get specific package
+      PACKAGE_ID=$(curl --header "PRIVATE-TOKEN: ${CI_JOB_TOKEN}" \
+        "${CI_API_V4_URL}/projects/${PROJECT_ID}/packages" | \
+        jq -r ".[0].id")
+      
+      if [ -n "$PACKAGE_ID" ] && [ "$PACKAGE_ID" != "null" ]; then
+        echo "Downloading package ID: ${PACKAGE_ID}"
+        
+        mkdir -p gitlab-packages
+        cd gitlab-packages
+        
+        # Download package files
+        curl --header "PRIVATE-TOKEN: ${CI_JOB_TOKEN}" \
+          "${CI_API_V4_URL}/projects/${PROJECT_ID}/packages/${PACKAGE_ID}/package_files" \
+          -o package-files.json
+        
+        cat package-files.json | jq '.'
+      else
+        echo "No packages found in GitLab Package Registry"
+      fi
+  artifacts:
+    paths:
+      - gitlab-packages/
+    expire_in: 7 days
+  rules:
+    - when: manual
+  environment:
+    name: gitlab-package-download
