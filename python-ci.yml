@@ -1,0 +1,292 @@
+# ================================================================
+# .gitlab-ci.yml  —  Python SDK
+# Stages  : validate → build → test → publish-snapshot →
+#           publish-release → download
+# Python  : 3.9 · 3.10 · 3.11 · 3.12
+# Publish : snapshot  (feature/*, develop, master/main)
+#           release   (semver tag v1.2.3 — manual gate)
+# ================================================================
+
+# ────────────────────────────────────────────────────────────────
+# REQUIRED CI/CD VARIABLES  (Settings → CI/CD → Variables)
+#   ARTIFACTORY_URL       https://artifactory.company.com/artifactory
+#   PYPI_SNAPSHOT_REPO    pypi-snapshot-local
+#   PYPI_RELEASE_REPO     pypi-release-local
+#   PYPI_VIRTUAL_REPO     pypi-virtual
+#   PYPI_USER             ← mask this
+#   PYPI_PASSWORD         ← mask this
+# ────────────────────────────────────────────────────────────────
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  TWINE_NON_INTERACTIVE: "true"
+  PYPI_SNAPSHOT_INDEX: "$ARTIFACTORY_URL/api/pypi/$PYPI_SNAPSHOT_REPO"
+  PYPI_RELEASE_INDEX: "$ARTIFACTORY_URL/api/pypi/$PYPI_RELEASE_REPO"
+  PYPI_DOWNLOAD_INDEX: "$ARTIFACTORY_URL/api/pypi/$PYPI_VIRTUAL_REPO/simple"
+
+cache:
+  key: "py-$CI_COMMIT_REF_SLUG"
+  paths:
+    - .cache/pip/
+
+stages:
+  - validate
+  - build
+  - test
+  - publish-snapshot
+  - publish-release
+  - download
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH =~ /^feature\/.*/'
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+    - if: '$CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
+
+# ── Shared before_script ──────────────────────────────────────
+.python_base:
+  before_script:
+    - echo "=============================="
+    - echo " Python CI"
+    - echo " Branch  $CI_COMMIT_REF_NAME"
+    - echo " Commit  $CI_COMMIT_SHORT_SHA"
+    - echo " Runner  $CI_RUNNER_DESCRIPTION"
+    - echo "=============================="
+    - python --version
+    - pip --version
+    - pip install --upgrade pip build twine
+    - REGISTRY_HOST=$(echo "$ARTIFACTORY_URL" | sed 's|https\?://||;s|/.*||')
+    - |
+      cat > ~/.pypirc <<PYPIRC
+      [distutils]
+      index-servers =
+          pypi-snapshot
+          pypi-release
+
+      [pypi-snapshot]
+      repository = $PYPI_SNAPSHOT_INDEX
+      username   = $PYPI_USER
+      password   = $PYPI_PASSWORD
+
+      [pypi-release]
+      repository = $PYPI_RELEASE_INDEX
+      username   = $PYPI_USER
+      password   = $PYPI_PASSWORD
+      PYPIRC
+    - mkdir -p ~/.config/pip
+    - |
+      cat > ~/.config/pip/pip.conf <<PIPCONF
+      [global]
+      index-url       = $PYPI_DOWNLOAD_INDEX
+      extra-index-url = https://pypi.org/simple/
+      trusted-host    = $REGISTRY_HOST
+      PIPCONF
+    - echo "[OK] .pypirc and pip.conf configured"
+
+# ── VALIDATE ─────────────────────────────────────────────────
+validate:
+  extends: .python_base
+  stage: validate
+  image: python:3.11-slim
+  script:
+    - echo "=== Validate project structure ==="
+    - |
+      if [ ! -f "setup.py" ] && [ ! -f "pyproject.toml" ]; then
+        echo "[ERROR] No setup.py or pyproject.toml found"
+        exit 1
+      fi
+    - pip install -e ".[dev]" --quiet 2>/dev/null || pip install -e . --quiet 2>/dev/null || true
+    - echo "[OK] Project is valid"
+  rules:
+    - if: '$CI_COMMIT_BRANCH || $CI_COMMIT_TAG'
+
+# ── BUILD (parallel across Python versions) ──────────────────
+.build_tpl:
+  extends: .python_base
+  stage: build
+  script:
+    - echo "=== Build ($(python --version)) ==="
+    - python -m build --sdist --wheel --outdir dist/
+    - ls -lh dist/
+  artifacts:
+    name: "dist-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - dist/
+    expire_in: 3 days
+  rules:
+    - if: '$CI_COMMIT_BRANCH || $CI_COMMIT_TAG'
+
+build:py39:
+  extends: .build_tpl
+  image: python:3.9-slim
+
+build:py310:
+  extends: .build_tpl
+  image: python:3.10-slim
+
+build:py311:
+  extends: .build_tpl
+  image: python:3.11-slim
+
+build:py312:
+  extends: .build_tpl
+  image: python:3.12-slim
+
+# ── TEST (parallel across Python versions) ───────────────────
+.test_tpl:
+  extends: .python_base
+  stage: test
+  script:
+    - echo "=== Test ($(python --version)) ==="
+    - pip install pytest pytest-cov --quiet
+    - pip install -e ".[dev]" --quiet 2>/dev/null || pip install -e . --quiet 2>/dev/null || true
+    - pytest tests/ -v --tb=short --cov=. --cov-report=term-missing --cov-report=xml:coverage.xml --junitxml=junit.xml
+    - coverage report || true
+  artifacts:
+    when: always
+    reports:
+      junit: junit.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+    expire_in: 7 days
+  coverage: '/TOTAL\s+\d+\s+\d+\s+(\d+%)/'
+  rules:
+    - if: '$CI_COMMIT_BRANCH || $CI_COMMIT_TAG'
+
+test:py39:
+  extends: .test_tpl
+  image: python:3.9-slim
+  needs: [build:py39]
+
+test:py310:
+  extends: .test_tpl
+  image: python:3.10-slim
+  needs: [build:py310]
+
+test:py311:
+  extends: .test_tpl
+  image: python:3.11-slim
+  needs: [build:py311]
+
+test:py312:
+  extends: .test_tpl
+  image: python:3.12-slim
+  needs: [build:py312]
+
+# ── PUBLISH SNAPSHOT ─────────────────────────────────────────
+# Auto-triggers on  feature/*, develop, master/main
+publish:snapshot:
+  extends: .python_base
+  stage: publish-snapshot
+  image: python:3.11-slim
+  needs:
+    - job: build:py311
+      artifacts: true
+    - job: test:py311
+  script:
+    - echo "=== Publish Snapshot ==="
+    - WHEEL=$(ls dist/*.whl | head -1)
+    - BASE_VER=$(echo "$WHEEL" | sed 's/.*-\([0-9][^-]*\)-.*/\1/')
+    - SNAP_VER="${BASE_VER}.dev${CI_PIPELINE_ID}"
+    - echo "  Base    $BASE_VER"
+    - echo "  Snap    $SNAP_VER"
+    - echo "  Repo    $PYPI_SNAPSHOT_REPO"
+    - |
+      for f in dist/*; do
+        NEW=$(echo "$f" | sed "s/${BASE_VER}/${SNAP_VER}/g")
+        [ "$f" != "$NEW" ] && mv "$f" "$NEW" && echo "  Renamed $NEW"
+      done
+    - ls -lh dist/
+    - twine upload --repository pypi-snapshot --verbose dist/*
+    - echo "=== Snapshot published ==="
+    - echo "  pip install --index-url $PYPI_SNAPSHOT_INDEX/simple <pkg>==$SNAP_VER"
+  environment:
+    name: pypi-snapshot
+    url: "$PYPI_SNAPSHOT_INDEX"
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^feature\/.*/'
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+    - if: '$CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"'
+
+# ── PUBLISH RELEASE ──────────────────────────────────────────
+# Only runs on tag v1.2.3 — requires manual click in GitLab UI
+publish:release:
+  extends: .python_base
+  stage: publish-release
+  image: python:3.11-slim
+  needs:
+    - job: build:py311
+      artifacts: true
+    - job: test:py311
+  script:
+    - echo "=== Publish Release ==="
+    - RELEASE_VER="${CI_COMMIT_TAG#v}"
+    - |
+      if ! echo "$RELEASE_VER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+        echo "[ERROR] Tag must be vX.Y.Z — got $CI_COMMIT_TAG"; exit 1
+      fi
+    - |
+      if echo "$RELEASE_VER" | grep -qiE '(dev|alpha|beta|rc|snapshot)'; then
+        echo "[ERROR] Release must not contain pre-release identifiers"; exit 1
+      fi
+    - echo "  Version  $RELEASE_VER"
+    - echo "  Repo     $PYPI_RELEASE_REPO"
+    - ls -lh dist/
+    - twine check dist/*
+    - twine upload --repository pypi-release --verbose dist/*
+    - echo "=== Release published ==="
+    - echo "  pip install --index-url $PYPI_DOWNLOAD_INDEX <pkg>==$RELEASE_VER"
+  environment:
+    name: pypi-release
+    url: "$PYPI_RELEASE_INDEX"
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
+      when: manual
+
+# ── DOWNLOAD ─────────────────────────────────────────────────
+# Set PACKAGE_NAME + PACKAGE_VERSION as pipeline/CI variables
+# Auto on release tags, or trigger manually any time
+download:package:
+  stage: download
+  image: python:3.11-slim
+  before_script:
+    - pip install --upgrade pip --quiet
+  script:
+    - echo "=== Download ==="
+    - PKG="${PACKAGE_NAME:-$CI_PROJECT_NAME}"
+    - VER="${PACKAGE_VERSION:-}"
+    - REGISTRY_HOST=$(echo "$ARTIFACTORY_URL" | sed 's|https\?://||;s|/.*||')
+    - echo "  Package  $PKG"
+    - echo "  Version  ${VER:-latest}"
+    - echo "  Index    $PYPI_DOWNLOAD_INDEX"
+    - mkdir -p downloaded-packages
+    - |
+      if [ -n "$VER" ]; then
+        pip download "${PKG}==${VER}" \
+          --index-url "$PYPI_DOWNLOAD_INDEX" \
+          --extra-index-url "https://pypi.org/simple/" \
+          --trusted-host "$REGISTRY_HOST" \
+          --dest downloaded-packages/ \
+          --no-deps --verbose
+      else
+        pip download "$PKG" \
+          --index-url "$PYPI_DOWNLOAD_INDEX" \
+          --extra-index-url "https://pypi.org/simple/" \
+          --trusted-host "$REGISTRY_HOST" \
+          --dest downloaded-packages/ \
+          --no-deps --verbose
+      fi
+    - echo "=== Downloaded files ==="
+    - ls -lh downloaded-packages/
+  artifacts:
+    name: "pypi-download-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - downloaded-packages/
+    expire_in: 7 days
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
+      when: on_success
+    - when: manual
